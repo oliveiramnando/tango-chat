@@ -447,7 +447,6 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                         }
                     }
 
-
                     inputBuffer.clear();
                     cout << "\033[92myou\033[0m > " << flush;
                     continue;
@@ -489,47 +488,49 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 }
 
                 // when certain command with user id is prompted set the recipient id that
-                if (inputBuffer.rfind(chatCMD, 0) == 0)
+                if (!words.empty() && words[0] == "/chat")
                 {
-                    string arg = inputBuffer.substr(chatCMD.size());
+                    cout << "\r\033[K";
 
-                    size_t n = 0;
-                    try
+                    optional<PeerId> contactId;
+                    if (words.size() == 2)
                     {
-                        n = stoul(arg);
+                        contactId = findByName(contacts, words[1]);
                     }
-                    catch(const exception&)
-                    {
-                        n = 0;
-                    }
-                    
 
-                    if (n < 1 || n > userIdVector.size())
+                    if (words.size() != 2)
                     {
-                        cout << "\r\033[K" << "No such user. Type /users to see the list." << endl;
+                        cerr << "Usage: /chat <contact name>" << endl;
+                    }
+                    else if (contacts.empty())
+                    {
+                        cerr << "No contacts yet. Type /users, then /add n name." << endl;
+                    }
+                    else if (!contactId)
+                    {
+                        cerr << "No such contact. Type /contacts to see the list." << endl;
                     }
                     else
                     {
-                        PeerId selected = userIdVector[n - 1];
+                        PeerId selected = *contactId;
                         bool online;
                         {
-                            lock_guard<mutex> lock(userIdsMutex);
+                            lock_guard<mutex> lockUid(userIdsMutex);
                             online = userIds.contains(selected);
                         }
                         if (!online)
                         {
-                            cout << "\r\033[K" << "That user is no longer online." << endl;
+                            cout << "That user is no longer online." << endl;
                         }
                         else
                         {
-                            cout << "\r\033[K" << "Now chatting with " << displayName(contacts, selected) << endl;
+                            cout << "Now chatting with " << displayName(contacts, selected) << endl;
                             currentPeer = selected;
-
-                            cout << "Establishing secure connection..." << endl;
 
                             auto it = sessions.find(selected);
                             if (it == sessions.end() || !it->second.hasKeyPair)
                             {
+                                cout << "Establishing secure connection..." << endl;
                                 if (!startHandshake(clientSocket, id, selected, sessions[selected]))
                                 {
                                     sessions.erase(selected);
