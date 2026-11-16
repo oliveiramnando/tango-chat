@@ -199,6 +199,8 @@ void wipeSession(Session &s)
     s.ready = false;
 
     s.isInitiator = false;
+
+    s.handshakeTime = {};
 }
 
 string sessionFingerPrint(const Session& s)

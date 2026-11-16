@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <sodium.h>
 #include <string>
+#include <chrono>
 
 #include "net.hpp"
 
@@ -30,6 +31,8 @@ struct Session
     bool ready = false;
 
     bool isInitiator = false;
+
+    std::chrono::steady_clock::time_point handshakeTime{};
 };
 
 bool loadOrCreateIdentity(const std::string& path, Identity& id);

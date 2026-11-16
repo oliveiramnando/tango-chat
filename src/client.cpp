@@ -27,6 +27,8 @@
 #include <filesystem>
 #include <cctype>
 
+#include <chrono>
+
 #include "net.hpp"
 #include "crypto.hpp"
 #include "util.hpp"
@@ -41,6 +43,8 @@ termios origTerminal{};
 atomic<bool> quitting = false;
 
 set<PeerId> userIds;
+
+constexpr chrono::seconds HANDSHAKE_RETRY_AFTER = chrono::seconds(5);
 
 void restoreTerminal()
 {
@@ -72,6 +76,8 @@ bool startHandshake(int sock, const Identity& me, const PeerId& peer, Session& s
     wipeSession(s);
     s.isInitiator = amInitiator(me, peer);
     makeKeyPair(s);
+
+    s.handshakeTime = chrono::steady_clock::now();
 
     unsigned char sig[crypto_sign_BYTES];
     if (!signHandshake(me, peer.data(), s.pk, sig))
@@ -194,6 +200,12 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     {
                         cerr << "Handshake signature invalid. Rejected." << endl;
                         cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        continue;
+                    }
+
+                    if (!contacts.contains(sender))
+                    {
+                        cerr << "Unknown [" << idFingerPrint(sender.data()) << "] wants to chat. Compare fingerprints, then /users and /add them." << endl;
                         continue;
                     }
 
@@ -527,17 +539,43 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                             cout << "Now chatting with " << displayName(contacts, selected) << endl;
                             currentPeer = selected;
 
+                            const string peerName = displayName(contacts, selected);
                             auto it = sessions.find(selected);
+
                             if (it == sessions.end() || !it->second.hasKeyPair)
                             {
                                 cout << "Establishing secure connection..." << endl;
                                 if (!startHandshake(clientSocket, id, selected, sessions[selected]))
                                 {
                                     sessions.erase(selected);
+                                    cerr << "Failed to send handshake to " << peerName << "." << endl;
                                 }
                             }
+                            else if (it->second.ready)
+                            {
+                                cout << "Already connected to " << peerName << "." << endl;
+                            }
+                            else
+                            {
+                                // retryu handshake
+                                auto waited = chrono::steady_clock::now() - it->second.handshakeTime;
+
+                                if (waited >= HANDSHAKE_RETRY_AFTER)
+                                {
+                                    cout << "No reply from " << peerName << " yet, retrying..." << endl;
+                                    if (!startHandshake(clientSocket, id, selected, it->second))
+                                    {
+                                        sessions.erase(it);
+                                        cerr << "Failed to send handshake to " << peerName << "." << endl;
+                                    }
+                                }
+                                else
+                                {
+                                    cout << "Still waiting for " << peerName << ". If it doesn't connect, make sure " << peerName << " has added you, then try /chat " << peerName << " again in a few seconds." << endl;
+                                }
+
+                            }
                         }
-                        
                     }
 
                     inputBuffer.clear();
