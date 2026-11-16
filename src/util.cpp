@@ -1,5 +1,6 @@
 #include "util.hpp"
 #include <cctype>
+#include <sstream>
 
 using namespace std;
 
@@ -32,4 +33,26 @@ vector<string> splitWords(const string& text)
     return words;
 }
 
+optional<size_t> parseListNumber(const string& text, size_t count)
+{
+    if (text.empty())
+    {
+        return nullopt;
+    }
+
+    for (char ch : text)
+    {
+        if (!isdigit(static_cast<unsigned char>(ch)))
+        {
+            return nullopt;
+        }
+    }
+
+    size_t number = stoul(text);
+    if (number < 1 || number > count)
+    {
+        return nullopt;
+    }
+    return number - 1; // Convert to 0-based index
+}
 
