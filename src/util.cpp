@@ -19,3 +19,17 @@ bool isValidName(const string& name)
     }
     return true;
 }
+
+vector<string> splitWords(const string& text)
+{
+    vector<string> words; 
+    stringstream in(text);
+    string word;
+    while (in >> word)
+    {
+        words.push_back(word);
+    }
+    return words;
+}
+
+
