@@ -354,6 +354,61 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     continue;
                 }
                 
+                vector<string> words = splitWords(inputBuffer);
+
+                if (!words.empty() && words[0] == "/add")
+                {
+                    cout << "\r\033[K";
+
+                    optional<size_t> index;
+                    if (words.size() == 3)
+                    {
+                        index = parseListNumber(words[1], userIdVector.size());
+                    }
+
+                    if (words.size() != 3)
+                    {
+                        cerr << "Usage: /add <number from /users> <name>" << endl;
+                    }
+                    else if (!index)
+                    {
+                        cerr << "No such user. Type /users to see the list." << endl;
+                    }
+                    else
+                    {
+                        const PeerId selected = userIdVector[*index];
+                        const string& newName = words[2];
+
+                        auto existing = contacts.find(selected);
+                        if (existing != contacts.end() && existing->second == newName)
+                        {
+                            cout << newName << " is already saved." << endl;
+                        }
+                        else
+                        {
+                            string error;
+                            if (!addContact(contacts, selected, newName, error))
+                            {
+                                cerr << "Could not add contact: " << error << endl;
+                            }
+                            else if (!saveContacts(contactsPath, contacts))
+                            {
+                                contacts.erase(selected);          // keep memory in step with the file
+                                cerr << "Could not save the contacts file." << endl;
+                            }
+                            else
+                            {
+                                cout << "Saved " << newName << " (" << idFingerPrint(selected.data()) << ")." << endl;
+                                cout << "Only trust this if it matches what " << newName << " sees as 'Your fingerprint'." << endl;
+                            }
+                        }
+                    }
+
+                    inputBuffer.clear();
+                    cout << "\033[92myou\033[0m > " << flush;
+                    continue;
+                }
+
                 // when certain command with user id is prompted set the recipient id that
                 if (inputBuffer.rfind(chatCMD, 0) == 0)
                 {
