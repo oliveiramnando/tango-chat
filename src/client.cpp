@@ -413,7 +413,6 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 {
                     cout << "\r\033[K";
 
-
                     optional<PeerId> contactId;
                     if (words.size() == 2)
                     {
@@ -439,12 +438,12 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
         
                         if (!saveContacts(contactsPath, contacts))
                         {
-                            // contacts.add(contactId, contactName);          // keep memory in step with the file
+                            contacts[*contactId] = contactName;         // keep memory in step with the file
                             cerr << "Could not save the contacts file." << endl;
                         }
                         else
                         {
-                            cout << "Contact removed." << endl;
+                            cout << "Contact removed: " << contactName << " (" << idFingerPrint(contactId->data()) << ")" << endl;
                         }
                     }
 
@@ -465,11 +464,11 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     }
                     else if (contacts.empty())
                     {
-                        cerr << "No contacts yet. Type /users, then /add n name." << endl;
+                        cout << "No contacts yet. Type /users, then /add n name." << endl;
                     }
                     else
                     {
-                        lock_guard<mutex> lock(userIdsMutex);
+                        lock_guard<mutex> lockUid(userIdsMutex);
 
                         for (const auto& [contactId, contactName] : contacts)
                         {
@@ -479,7 +478,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                             }
                             else
                             {
-                                cout << contactName << endl;
+                                cout << "  " << contactName << endl;
                             }
                         }
                     }
@@ -488,6 +487,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     cout << "\033[92myou\033[0m > " << flush;
                     continue;
                 }
+
                 // when certain command with user id is prompted set the recipient id that
                 if (inputBuffer.rfind(chatCMD, 0) == 0)
                 {
