@@ -163,7 +163,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     string name = nameAndMessage.substr(0, colonIdx);
                     string message = nameAndMessage.substr(colonIdx + 3);
                         
-                    cout << "\033[94m" << name << "\033[0m : " << message << endl;
+                    cout << "\033[94m" << displayName(contacts, sender) << "\033[0m : " << message << endl;
                     cout << "\033[92myou\033[0m > " << inputBuffer << flush;
                 }
                 continue;
@@ -206,6 +206,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (!contacts.contains(sender))
                     {
                         cerr << "Unknown [" << idFingerPrint(sender.data()) << "] wants to chat. Compare fingerprints, then /users and /add them." << endl;
+                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
                         continue;
                     }
 
@@ -323,8 +324,6 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
     }
 
     char ch;
-
-    const string chatCMD = "/chat ";
 
     vector<PeerId> userIdVector;
     optional<PeerId> currentPeer;
@@ -456,7 +455,23 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                         else
                         {
                             cout << "Contact removed: " << contactName << " (" << idFingerPrint(contactId->data()) << ")" << endl;
+
+                            // end any session with them
+                            auto it = sessions.find(*contactId);
+                            if (it != sessions.end())
+                            {
+                                wipeSession(it->second);
+                                sessions.erase(it);
+                            }
+
+                            // deselect them only if they're the person we're currently chatting with.
+                            if (currentPeer && *currentPeer == *contactId)
+                            {
+                                currentPeer.reset();
+                                cout << "Chat with " << contactName << " closed." << endl;
+                            }
                         }
+                        
                     }
 
                     inputBuffer.clear();
@@ -485,11 +500,11 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                         {
                             if (userIds.contains(contactId))
                             {
-                                cout << "* " << contactName << endl;
+                                cout << "* " << contactName << " [" << idFingerPrint(contactId.data()) << "]" << endl;
                             }
                             else
                             {
-                                cout << "  " << contactName << endl;
+                                cout << "  " << contactName << " [" << idFingerPrint(contactId.data()) << "]" << endl;
                             }
                         }
                     }
@@ -499,7 +514,6 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     continue;
                 }
 
-                // when certain command with user id is prompted set the recipient id that
                 if (!words.empty() && words[0] == "/chat")
                 {
                     cout << "\r\033[K";
@@ -592,7 +606,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 if (!currentPeer)
                 {
                     cout << "\r\033[K";
-                    cerr << "No chat selected. Type /users, then /chat <n>." << endl;
+                    cerr << "No chat selected. Type /contacts, then /chat <name>." << endl;
                     cout << "\033[92myou\033[0m > " << inputBuffer << flush;
                     continue;
                 }
