@@ -409,6 +409,36 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     continue;
                 }
 
+                if (!words.empty() && words[0] == "/contacts")
+                {
+                    cout << "\r\033[K";
+
+                
+                    if (words.size() != 1)
+                    {
+                        cerr << "Usage: /contacts" << endl;
+                    }
+                    else if (contacts.empty())
+                    {
+                        cerr << "No contacts yet. Type /users, then /add n name." << endl;
+                    }
+                    else
+                    {
+                        lock_guard<mutex> lock(userIdsMutex);
+
+                        for (const auto& [contactId, contactName] : contacts)
+                        {
+                            if (userIds.contains(contactId))
+                            {
+                                cout << contactName << endl;
+                            }
+                        }
+                    }
+
+                    inputBuffer.clear();
+                    cout << "\033[92myou\033[0m > " << flush;
+                    continue;
+                }
                 // when certain command with user id is prompted set the recipient id that
                 if (inputBuffer.rfind(chatCMD, 0) == 0)
                 {
