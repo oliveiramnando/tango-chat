@@ -35,7 +35,7 @@ vector<string> splitWords(const string& text)
 
 optional<size_t> parseListNumber(const string& text, size_t count)
 {
-    if (text.empty())
+    if (text.empty() || text.size() > 9)
     {
         return nullopt;
     }
