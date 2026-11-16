@@ -409,6 +409,51 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     continue;
                 }
 
+                if (!words.empty() && words[0] == "/remove")
+                {
+                    cout << "\r\033[K";
+
+
+                    optional<PeerId> contactId;
+                    if (words.size() == 2)
+                    {
+                        contactId = findByName(contacts, words[1]);
+                    }
+
+                    if (words.size() != 2)
+                    {
+                        cerr << "Usage: /remove <contact name>" << endl;
+                    }
+                    else if (contacts.empty())
+                    {
+                        cerr << "No contacts yet. Type /users, then /add n name." << endl;
+                    }
+                    else if (!contactId)
+                    {
+                        cerr << "No such contact. Type /contacts to see the list." << endl;
+                    }
+                    else
+                    {
+                        string contactName = words[1];
+                        contacts.erase(*contactId);
+        
+                        if (!saveContacts(contactsPath, contacts))
+                        {
+                            // contacts.add(contactId, contactName);          // keep memory in step with the file
+                            cerr << "Could not save the contacts file." << endl;
+                        }
+                        else
+                        {
+                            cout << "Contact removed." << endl;
+                        }
+                    }
+
+
+                    inputBuffer.clear();
+                    cout << "\033[92myou\033[0m > " << flush;
+                    continue;
+                }
+
                 if (!words.empty() && words[0] == "/contacts")
                 {
                     cout << "\r\033[K";
@@ -429,6 +474,10 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                         for (const auto& [contactId, contactName] : contacts)
                         {
                             if (userIds.contains(contactId))
+                            {
+                                cout << "* " << contactName << endl;
+                            }
+                            else
                             {
                                 cout << contactName << endl;
                             }
