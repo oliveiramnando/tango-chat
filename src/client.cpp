@@ -46,6 +46,18 @@ set<PeerId> userIds;
 
 constexpr chrono::seconds HANDSHAKE_RETRY_AFTER = chrono::seconds(5);
 
+string promptTarget;
+
+void redrawPrompt()     // caller must hold terminalMutex.
+{
+    cout << "\r\033[K\033[92myou\033[0m";
+    if (!promptTarget.empty())
+    {
+        cout << " -> \033[94m" << promptTarget << "\033[0m";
+    }
+    cout << " > " << inputBuffer << flush;
+}
+
 void restoreTerminal()
 {
     tcsetattr(STDIN_FILENO, TCSANOW, &origTerminal);
@@ -128,7 +140,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (!parseBody(body, sender, payload))
                     {
                         cerr << "Malformed MESSAGE received." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
 
@@ -137,7 +149,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (it == sessions.end() || !it->second.ready)
                     {
                         cerr << "Message from unknown or unsecured peer rejected." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
 
@@ -146,7 +158,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if(!decrypt(decryptedMessage, string(payload.begin(), payload.end()), it->second.rx))
                     {
                         cerr << "Failed to decrypt message." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
                     string nameAndMessage(decryptedMessage.begin(), decryptedMessage.end());
@@ -156,7 +168,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     {
                         cout << "\r\033[K";
                         cerr << "Client sender does not have a name" << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         
                         continue;
                     }
@@ -164,7 +176,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     string message = nameAndMessage.substr(colonIdx + 3);
                         
                     cout << "\033[94m" << displayName(contacts, sender) << "\033[0m : " << message << endl;
-                    cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                 }
                 continue;
             case MsgType::HANDSHAKE:
@@ -179,7 +191,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (!parseBody(body, sender, payload))
                     {
                         cerr << "Malformed HANDSHAKE received." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
 
@@ -187,7 +199,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (payload.size() != HANDSHAKE_PAYLOAD_SIZE)
                     {
                         cerr << "Malformed payload received." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
 
@@ -199,14 +211,14 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (!verifyHandshake(sender.data(), id.pk, ephPk, sig))
                     {
                         cerr << "Handshake signature invalid. Rejected." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
 
                     if (!contacts.contains(sender))
                     {
                         cerr << "Unknown [" << idFingerPrint(sender.data()) << "] wants to chat. Compare fingerprints, then /users and /add them." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
 
@@ -222,7 +234,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                         {
                             cerr << "Failed to send HANDSHAKE reply." << endl;
                             sessions.erase(sender);
-                            cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                            redrawPrompt();
                             continue;
                         }
                     }
@@ -234,7 +246,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                         cerr << "HANDSHAKE rejected." << endl;
                         wipeSession(s);
                         sessions.erase(sender);
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
                     s.ready = true;
@@ -244,7 +256,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     string fingerPrint = sessionFingerPrint(s);
                     cout << "Session fingerprint: " << fingerPrint << endl;
 
-                    cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                 }
                 continue;
             case MsgType::ERROR_MSG:
@@ -252,7 +264,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     lock_guard<mutex> lock(terminalMutex);
                     cout << "\r\033[K";
                     cerr << body << endl;
-                    cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                 }
                 continue;
             case MsgType::USER_LIST:
@@ -262,10 +274,10 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     if (!parseUserList(body, userIds))
                     {
                         cerr << "Failed to parse list of online users." << endl;
-                        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                        redrawPrompt();
                         continue;
                     }
-                    cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                 }
                 continue;
             case MsgType::USER_ONLINE:
@@ -319,8 +331,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
 {
     {
         lock_guard<mutex> lock(terminalMutex);
-        cout << "\r\033[K";
-        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+        redrawPrompt();
     }
 
     char ch;
@@ -361,7 +372,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                         n++;
                     }
                     inputBuffer.clear();
-                    cout << "\033[92myou\033[0m > " << flush;
+                    redrawPrompt();
                     continue;
                 }
                 
@@ -416,7 +427,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     }
 
                     inputBuffer.clear();
-                    cout << "\033[92myou\033[0m > " << flush;
+                    redrawPrompt();
                     continue;
                 }
 
@@ -468,6 +479,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                             if (currentPeer && *currentPeer == *contactId)
                             {
                                 currentPeer.reset();
+                                promptTarget.clear();
                                 cout << "Chat with " << contactName << " closed." << endl;
                             }
                         }
@@ -475,7 +487,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     }
 
                     inputBuffer.clear();
-                    cout << "\033[92myou\033[0m > " << flush;
+                    redrawPrompt();
                     continue;
                 }
 
@@ -510,7 +522,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     }
 
                     inputBuffer.clear();
-                    cout << "\033[92myou\033[0m > " << flush;
+                    redrawPrompt();
                     continue;
                 }
 
@@ -554,6 +566,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                             currentPeer = selected;
 
                             const string peerName = displayName(contacts, selected);
+                            promptTarget = peerName;
                             auto it = sessions.find(selected);
 
                             if (it == sessions.end() || !it->second.hasKeyPair)
@@ -593,7 +606,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                     }
 
                     inputBuffer.clear();
-                    cout << "\033[92myou\033[0m > " << flush;
+                    redrawPrompt();
                     continue;                    
                 }
 
@@ -607,7 +620,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 {
                     cout << "\r\033[K";
                     cerr << "No chat selected. Type /contacts, then /chat <name>." << endl;
-                    cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                     continue;
                 }
 
@@ -616,7 +629,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 {
                     cout << "\r\033[K";
                     cerr << "Connection not secured yet. Wait for the fingerprint." << endl;
-                    cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                     continue;
                 }
 
@@ -628,7 +641,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 if (!encrypt(message, encrypted, it->second.tx))
                 {
                     cerr << "Failed to encrypt" << endl;
-                    cout << "\n\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                     continue;
                 }
                 
@@ -636,7 +649,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 if (frameBody.size() + 1 > MAX_MESSAGE_SIZE)
                 {
                     cerr << "Invalid Message Length" << endl;
-                    cout << "\n\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                     continue;
                 }              
 
@@ -644,17 +657,15 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 if (!sendFrame(clientSocket, msg, frameBody))
                 {
                     cerr << "Failed to send frame" << endl;
-                    cout << "\n\033[92myou\033[0m > " << inputBuffer << flush;
+                    redrawPrompt();
                     continue;
                 }
 
                 // print sent message
                 cout << "\r\033[K";
-                cout << "\033[92myou\033[0m : " << inputBuffer << flush;
+                cout << "\033[92myou\033[0m : " << inputBuffer << endl;
                 inputBuffer.clear();
-
-                // redraw prompt
-                cout << "\n\033[92myou\033[0m > " << flush; 
+                redrawPrompt();
                 continue;
             }
 
@@ -672,8 +683,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 inputBuffer += ch;
             }
 
-	        cout << "\r\033[K";
-	        cout << "\033[92myou\033[0m > " << inputBuffer << flush;
+	        redrawPrompt();
         }
     }
 }
