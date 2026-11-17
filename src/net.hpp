@@ -32,6 +32,11 @@ enum class MsgType : uint8_t {
     USER_OFFLINE=11,
 };
 
+enum class HandshakeType : uint8_t {
+    REPLY=1,
+    OFFER=2,
+};
+
 enum class Role : uint8_t {
     RESPONDER=0,
     INITIATOR=1,
