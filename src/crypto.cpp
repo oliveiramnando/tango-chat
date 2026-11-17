@@ -9,6 +9,8 @@
 #include <cstring>
 #include <filesystem>
 
+#include "net.hpp"
+
 using namespace std;
 
 bool loadOrCreateIdentity(const string& path, Identity& id)
@@ -86,31 +88,67 @@ bool loadOrCreateIdentity(const string& path, Identity& id)
     return true;
 }
 
-vector<unsigned char> buildHandshakeMessage(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk)
+vector<unsigned char> buildHandshakeMessage(std::string_view label, const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* answeredPk)
 {
-    // build signed message: "tcpchat-handshake-v1" || sender ID || recipient ID || ephemeral pk
-    constexpr size_t LABEL_LEN = sizeof(HANDSHAKE_LABEL) - 1;
+    // offer:  label || sender ID || recipient ID || offer key
+    // reply:  label || sender ID || recipient ID || reply key || answered offer key
+    const size_t LABEL_LEN = label.size();
     constexpr size_t KEY_LEN = crypto_kx_PUBLICKEYBYTES;     // 32
-
-    vector<unsigned char> msg(LABEL_LEN + KEY_LEN*3);
-
-    memcpy(msg.data(), HANDSHAKE_LABEL, LABEL_LEN);
+    
+    size_t MSG_LEN = LABEL_LEN + KEY_LEN*3;
+    if (answeredPk != nullptr)
+    {
+        MSG_LEN += KEY_LEN;
+    }
+   
+    vector<unsigned char> msg(MSG_LEN);
+ 
+    memcpy(msg.data(), label.data(), LABEL_LEN);
     memcpy(msg.data() + LABEL_LEN, senderPk, KEY_LEN);
     memcpy(msg.data() + LABEL_LEN + KEY_LEN, recipientPk, KEY_LEN);
     memcpy(msg.data() + LABEL_LEN + KEY_LEN*2, ephPk, KEY_LEN);
+
+    if (answeredPk != nullptr)
+    {
+        memcpy(msg.data() + LABEL_LEN + KEY_LEN*3, answeredPk, KEY_LEN);
+    }
 
     return msg;
 }
 
 bool signHandshake(const Identity& me, const unsigned char* recipientPk, const unsigned char* ephPk, unsigned char sig[crypto_sign_BYTES])
 {
-    vector<unsigned char> handshakeMsg = buildHandshakeMessage(me.pk, recipientPk, ephPk);
+    vector<unsigned char> handshakeMsg = buildHandshakeMessage(HANDSHAKE_LABEL, me.pk, recipientPk, ephPk);
     return crypto_sign_detached(sig, nullptr, handshakeMsg.data(), handshakeMsg.size(), me.sk) == 0;
 }
 
 bool verifyHandshake(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* sig)
 {
-    vector<unsigned char> handshakeMsg = buildHandshakeMessage(senderPk, recipientPk, ephPk);
+    vector<unsigned char> handshakeMsg = buildHandshakeMessage(HANDSHAKE_LABEL, senderPk, recipientPk, ephPk);
+    return crypto_sign_verify_detached(sig, handshakeMsg.data(), handshakeMsg.size(), senderPk) == 0;
+}
+
+bool signOffer(const Identity& me, const unsigned char* recipientPk, const unsigned char* offerPk, unsigned char sig[crypto_sign_BYTES])
+{
+    vector<unsigned char> handshakeMsg = buildHandshakeMessage(OFFER_LABEL, me.pk, recipientPk, offerPk);
+    return crypto_sign_detached(sig, nullptr, handshakeMsg.data(), handshakeMsg.size(), me.sk) == 0;
+}
+
+bool verifyOffer(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* offerPk, const unsigned char* sig)
+{
+    vector<unsigned char> handshakeMsg = buildHandshakeMessage(OFFER_LABEL, senderPk, recipientPk, offerPk);
+    return crypto_sign_verify_detached(sig, handshakeMsg.data(), handshakeMsg.size(), senderPk) == 0;
+}
+
+bool signReply(const Identity& me, const unsigned char* recipientPk, const unsigned char* replyPk, const unsigned char* answeredPk, unsigned char sig[crypto_sign_BYTES])
+{
+    vector<unsigned char> handshakeMsg = buildHandshakeMessage(REPLY_LABEL, me.pk, recipientPk, replyPk, answeredPk);
+    return crypto_sign_detached(sig, nullptr, handshakeMsg.data(), handshakeMsg.size(), me.sk) == 0;
+}
+
+bool verifyReply(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* replyPk, const unsigned char* answeredPk, const unsigned char* sig)
+{
+    vector<unsigned char> handshakeMsg = buildHandshakeMessage(REPLY_LABEL, senderPk, recipientPk, replyPk, answeredPk);
     return crypto_sign_verify_detached(sig, handshakeMsg.data(), handshakeMsg.size(), senderPk) == 0;
 }
 
@@ -119,6 +157,7 @@ bool signLogin(const Identity& id, const array<unsigned char, CHALLENGE_BYTES>& 
     vector<unsigned char> message = buildLoginMessage(challenge);
     return crypto_sign_detached(signature, nullptr, message.data(), message.size(), id.sk) == 0;
 }
+
 
 string idFingerPrint(const unsigned char* pk)
 {
@@ -147,6 +186,7 @@ string idFingerPrint(const unsigned char* pk)
 
     return fingerPrint;
 }
+
 
 void makeKeyPair(Session &s)
 {
@@ -186,6 +226,7 @@ bool deriveSessionKeys(Session &s, const string &peerPk)
     return true;
 }
 
+
 void wipeSession(Session &s)
 {
     sodium_memzero(s.pk , crypto_kx_PUBLICKEYBYTES);
@@ -202,6 +243,7 @@ void wipeSession(Session &s)
 
     s.handshakeTime = {};
 }
+
 
 string sessionFingerPrint(const Session& s)
 {
@@ -239,6 +281,7 @@ string sessionFingerPrint(const Session& s)
 
     return fingerPrint;
 }
+
 
 bool encrypt(const string& message, vector<unsigned char>& encrypted, const unsigned char* key)
 {

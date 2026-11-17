@@ -5,7 +5,6 @@
 #include <vector>
 #include <cstdint>
 #include <sodium.h>
-#include <string>
 #include <chrono>
 
 #include "net.hpp"
@@ -37,9 +36,18 @@ struct Session
 
 bool loadOrCreateIdentity(const std::string& path, Identity& id);
 
-std::vector<unsigned char> buildHandshakeMessage(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk);
+std::vector<unsigned char> buildHandshakeMessage(std::string_view label, const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* answeredPk = nullptr);
+
 bool signHandshake(const Identity& me, const unsigned char* recipientPk, const unsigned char* ephPk, unsigned char sig[crypto_sign_BYTES]);
 bool verifyHandshake(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* sig);
+
+
+bool signOffer(const Identity& me, const unsigned char* recipientPk, const unsigned char* offerPk, unsigned char sig[crypto_sign_BYTES]);
+bool verifyOffer(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* offerPk, const unsigned char* sig);
+
+bool signReply(const Identity& me, const unsigned char* recipientPk, const unsigned char* replyPk, const unsigned char* answeredPk, unsigned char sig[crypto_sign_BYTES]);
+bool verifyReply(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* replyPk, const unsigned char* answeredPk, const unsigned char* sig);
+
 
 bool signLogin(const Identity& id, const std::array<unsigned char, CHALLENGE_BYTES>& challenge, unsigned char signature[crypto_sign_BYTES]);
 
