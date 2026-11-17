@@ -112,6 +112,7 @@ bool startHandshake(int sock, const Identity& me, const PeerId& peer, Session& s
 
 void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts)
 {
+    set<PeerId> notifiedUnknown;
     while (true)
     {
         MsgType type;
@@ -217,7 +218,11 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
 
                     if (!contacts.contains(sender))
                     {
-                        cerr << "Unknown [" << idFingerPrint(sender.data()) << "] wants to chat. Compare fingerprints, then /users and /add them." << endl;
+                        if (!notifiedUnknown.contains(sender))
+                        {
+                            cerr << "Unknown [" << idFingerPrint(sender.data()) << "] wants to chat. Compare fingerprints, then /users and /add them." << endl;
+                            notifiedUnknown.insert(sender);
+                        }
                         redrawPrompt();
                         continue;
                     }
