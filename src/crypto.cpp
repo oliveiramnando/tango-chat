@@ -241,6 +241,8 @@ void wipeSession(Session &s)
 
     s.isInitiator = false;
 
+    s.state = SessionState::NONE;
+
     s.handshakeTime = {};
 }
 

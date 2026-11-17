@@ -10,11 +10,19 @@
 #include "net.hpp"
 
 constexpr std::size_t HANDSHAKE_PAYLOAD_SIZE = crypto_kx_PUBLICKEYBYTES + crypto_sign_BYTES;  // 96 
+constexpr std::size_t OFFER_PAYLOAD_SIZE = 1 + crypto_kx_PUBLICKEYBYTES + crypto_sign_BYTES;  // 97
+constexpr std::size_t REPLY_PAYLOAD_SIZE = 1 + crypto_kx_PUBLICKEYBYTES*2 + crypto_sign_BYTES;  // 129 
 
 struct Identity
 {
     unsigned char pk[crypto_sign_PUBLICKEYBYTES]{}; 
     unsigned char sk[crypto_sign_SECRETKEYBYTES]{};
+};
+
+enum class SessionState {
+    NONE,
+    READY,
+    OFFERED,
 };
 
 struct Session
@@ -30,6 +38,8 @@ struct Session
     bool ready = false;
 
     bool isInitiator = false;
+
+    SessionState state = SessionState::NONE;
 
     std::chrono::steady_clock::time_point handshakeTime{};
 };
