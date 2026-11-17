@@ -1,5 +1,5 @@
 #include "doctest.h"
-#include "../src/crypto.hpp"
+#include "crypto.hpp"
 
 #include <cstring>
 #include <string>
@@ -23,22 +23,52 @@ static vector<unsigned char> filled(unsigned char value)
 
 // ---------- buildHandshakeMessage ----------
 
-TEST_CASE("buildHandshakeMessage: length and field order")
+TEST_CASE("buildHandshakeMessage: offer layout")
 {
     vector<unsigned char> sender = filled(0x11);
     vector<unsigned char> recipient = filled(0x22);
-    vector<unsigned char> eph = filled(0x33);
+    vector<unsigned char> offer = filled(0x33);
 
-    vector<unsigned char> msg = buildHandshakeMessage(sender.data(), recipient.data(), eph.data());
+    vector<unsigned char> msg = buildHandshakeMessage(OFFER_LABEL, sender.data(), recipient.data(), offer.data());
 
-    const size_t labelLen = sizeof(HANDSHAKE_LABEL) - 1;   // 20, no '\0'
-    REQUIRE(labelLen == 20);
-    REQUIRE(msg.size() == labelLen + 32 * 3);
+    const size_t labelLen = OFFER_LABEL.size();
+    REQUIRE(labelLen == 16);
+    REQUIRE(msg.size() == labelLen + 32 * 3);       // 112
 
-    CHECK(memcmp(msg.data(), HANDSHAKE_LABEL, labelLen) == 0);
+    CHECK(memcmp(msg.data(), OFFER_LABEL.data(), labelLen) == 0);
     CHECK(memcmp(msg.data() + labelLen,      sender.data(),    32) == 0);
     CHECK(memcmp(msg.data() + labelLen + 32, recipient.data(), 32) == 0);
-    CHECK(memcmp(msg.data() + labelLen + 64, eph.data(),       32) == 0);
+    CHECK(memcmp(msg.data() + labelLen + 64, offer.data(),     32) == 0);
+}
+
+TEST_CASE("buildHandshakeMessage: reply layout adds the answered key at the end")
+{
+    vector<unsigned char> sender = filled(0x11);
+    vector<unsigned char> recipient = filled(0x22);
+    vector<unsigned char> reply = filled(0x44);
+    vector<unsigned char> answered = filled(0x33);
+
+    vector<unsigned char> msg = buildHandshakeMessage(REPLY_LABEL, sender.data(), recipient.data(),
+                                                      reply.data(), answered.data());
+
+    const size_t labelLen = REPLY_LABEL.size();
+    REQUIRE(labelLen == 16);
+    REQUIRE(msg.size() == labelLen + 32 * 4);       // 144
+
+    CHECK(memcmp(msg.data(), REPLY_LABEL.data(), labelLen) == 0);
+    CHECK(memcmp(msg.data() + labelLen,      sender.data(),    32) == 0);
+    CHECK(memcmp(msg.data() + labelLen + 32, recipient.data(), 32) == 0);
+    CHECK(memcmp(msg.data() + labelLen + 64, reply.data(),     32) == 0);
+    CHECK(memcmp(msg.data() + labelLen + 96, answered.data(),  32) == 0);
+}
+
+TEST_CASE("offer and reply labels differ, so their messages can never be equal")
+{
+    CHECK(OFFER_LABEL != REPLY_LABEL);
+
+    vector<unsigned char> k = filled(0x55);
+    CHECK(buildHandshakeMessage(OFFER_LABEL, k.data(), k.data(), k.data()) !=
+          buildHandshakeMessage(REPLY_LABEL, k.data(), k.data(), k.data()));
 }
 
 // ---------- signHandshake / verifyHandshake ----------
@@ -220,4 +250,157 @@ TEST_CASE("decrypt rejects the wrong key")
 
     vector<unsigned char> decrypted;
     CHECK_FALSE(decrypt(decrypted, string(encrypted.begin(), encrypted.end()), otherKey.data()));
+}
+
+// ---------- signOffer / verifyOffer ----------
+
+TEST_CASE("verifyOffer accepts a valid offer and rejects any change")
+{
+    Identity alice = makeIdentity();
+    Identity bob = makeIdentity();
+    Identity carol = makeIdentity();
+
+    unsigned char offer[crypto_kx_PUBLICKEYBYTES];
+    randombytes_buf(offer, sizeof(offer));
+
+    // alice offers her key to bob
+    unsigned char sig[crypto_sign_BYTES];
+    REQUIRE(signOffer(alice, bob.pk, offer, sig));
+
+    SUBCASE("valid offer passes")
+    {
+        CHECK(verifyOffer(alice.pk, bob.pk, offer, sig));
+    }
+
+    SUBCASE("different sender fails")
+    {
+        CHECK_FALSE(verifyOffer(carol.pk, bob.pk, offer, sig));
+    }
+
+    SUBCASE("different recipient fails (offer redirected to carol)")
+    {
+        CHECK_FALSE(verifyOffer(alice.pk, carol.pk, offer, sig));
+    }
+
+    SUBCASE("changed offer key fails")
+    {
+        unsigned char other[crypto_kx_PUBLICKEYBYTES];
+        memcpy(other, offer, sizeof(offer));
+        other[0] ^= 0x01;
+        CHECK_FALSE(verifyOffer(alice.pk, bob.pk, other, sig));
+    }
+
+    SUBCASE("changed signature fails")
+    {
+        unsigned char badSig[crypto_sign_BYTES];
+        memcpy(badSig, sig, sizeof(sig));
+        badSig[10] ^= 0x01;
+        CHECK_FALSE(verifyOffer(alice.pk, bob.pk, offer, badSig));
+    }
+
+    SUBCASE("offer signed by the wrong identity fails")
+    {
+        unsigned char carolSig[crypto_sign_BYTES];
+        REQUIRE(signOffer(carol, bob.pk, offer, carolSig));
+        CHECK_FALSE(verifyOffer(alice.pk, bob.pk, offer, carolSig));
+    }
+}
+
+// ---------- signReply / verifyReply ----------
+
+TEST_CASE("verifyReply accepts a valid reply and rejects any change")
+{
+    Identity alice = makeIdentity();
+    Identity bob = makeIdentity();
+    Identity carol = makeIdentity();
+
+    unsigned char offer[crypto_kx_PUBLICKEYBYTES];      // alice's offer
+    unsigned char reply[crypto_kx_PUBLICKEYBYTES];      // bob's reply key
+    randombytes_buf(offer, sizeof(offer));
+    randombytes_buf(reply, sizeof(reply));
+
+    // bob replies to alice's offer
+    unsigned char sig[crypto_sign_BYTES];
+    REQUIRE(signReply(bob, alice.pk, reply, offer, sig));
+
+    SUBCASE("valid reply passes")
+    {
+        CHECK(verifyReply(bob.pk, alice.pk, reply, offer, sig));
+    }
+
+    SUBCASE("different sender fails")
+    {
+        CHECK_FALSE(verifyReply(carol.pk, alice.pk, reply, offer, sig));
+    }
+
+    SUBCASE("different recipient fails (reply redirected to carol)")
+    {
+        CHECK_FALSE(verifyReply(bob.pk, carol.pk, reply, offer, sig));
+    }
+
+    SUBCASE("changed reply key fails")
+    {
+        unsigned char other[crypto_kx_PUBLICKEYBYTES];
+        memcpy(other, reply, sizeof(reply));
+        other[0] ^= 0x01;
+        CHECK_FALSE(verifyReply(bob.pk, alice.pk, other, offer, sig));
+    }
+
+    SUBCASE("reply checked against a different offer fails (stale or replayed reply)")
+    {
+        unsigned char newerOffer[crypto_kx_PUBLICKEYBYTES];
+        randombytes_buf(newerOffer, sizeof(newerOffer));
+        CHECK_FALSE(verifyReply(bob.pk, alice.pk, reply, newerOffer, sig));
+    }
+
+    SUBCASE("reply and answered keys swapped fails")
+    {
+        CHECK_FALSE(verifyReply(bob.pk, alice.pk, offer, reply, sig));
+    }
+
+    SUBCASE("changed signature fails")
+    {
+        unsigned char badSig[crypto_sign_BYTES];
+        memcpy(badSig, sig, sizeof(sig));
+        badSig[10] ^= 0x01;
+        CHECK_FALSE(verifyReply(bob.pk, alice.pk, reply, offer, badSig));
+    }
+
+    SUBCASE("reply signed by the wrong identity fails")
+    {
+        unsigned char carolSig[crypto_sign_BYTES];
+        REQUIRE(signReply(carol, alice.pk, reply, offer, carolSig));
+        CHECK_FALSE(verifyReply(bob.pk, alice.pk, reply, offer, carolSig));
+    }
+}
+
+// ---------- offers and replies can't be confused ----------
+
+TEST_CASE("an offer signature is never accepted as a reply, and vice versa")
+{
+    Identity alice = makeIdentity();
+    Identity bob = makeIdentity();
+
+    unsigned char keyA[crypto_kx_PUBLICKEYBYTES];
+    unsigned char keyB[crypto_kx_PUBLICKEYBYTES];
+    randombytes_buf(keyA, sizeof(keyA));
+    randombytes_buf(keyB, sizeof(keyB));
+
+    SUBCASE("offer signature checked as a reply")
+    {
+        unsigned char offerSig[crypto_sign_BYTES];
+        REQUIRE(signOffer(alice, bob.pk, keyA, offerSig));
+
+        CHECK_FALSE(verifyReply(alice.pk, bob.pk, keyA, keyB, offerSig));
+        CHECK_FALSE(verifyReply(alice.pk, bob.pk, keyA, keyA, offerSig));
+    }
+
+    SUBCASE("reply signature checked as an offer")
+    {
+        unsigned char replySig[crypto_sign_BYTES];
+        REQUIRE(signReply(alice, bob.pk, keyA, keyB, replySig));
+
+        CHECK_FALSE(verifyOffer(alice.pk, bob.pk, keyA, replySig));
+        CHECK_FALSE(verifyOffer(alice.pk, bob.pk, keyB, replySig));
+    }
 }
