@@ -83,6 +83,89 @@ bool amInitiator(const Identity& me, const PeerId& peer)
     return memcmp(me.pk, peer.data(), 32) < 0;
 }
 
+bool sendOffer(int sock, const Identity& me, const PeerId& peer, Session& s)
+{
+    wipeSession(s);
+    s.isInitiator = amInitiator(me, peer);
+    makeKeyPair(s);
+
+    unsigned char sig[crypto_sign_BYTES];
+    if (!signOffer(me, peer.data(), s.pk, sig))
+    {
+        return false;
+    }
+
+    vector<unsigned char> handshakePayload(static_cast<unsigned char>(HandshakeType::OFFER));   // [Type]
+    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [Type][Key]
+    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [Type][key][sig]
+
+    vector<unsigned char> body = buildBody(peer, handshakePayload);
+
+    if(!sendFrame(sock, MsgType::HANDSHAKE, body))
+    {
+        return false;
+    }
+
+    s.state = SessionState::OFFERED;
+
+    return true;
+}
+
+bool sendReply(int sock, const Identity& me, const PeerId& peer, Session& s, const unsigned char* offerPk)
+{
+    wipeSession(s);
+    s.isInitiator = amInitiator(me, peer);
+    makeKeyPair(s);
+
+    if (!deriveSessionKeys(s, string(offerPk, offerPk + crypto_kx_PUBLICKEYBYTES)))
+    {
+        return false;
+    }
+
+    unsigned char sig[crypto_sign_BYTES];
+    if (!signReply(me, peer.data(), s.pk, offerPk, sig))
+    {
+        return false;
+    }
+
+    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::REPLY)};       // [type]
+    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);         // [type][key]
+    handshakePayload.insert(handshakePayload.end(), offerPk, offerPk + crypto_kx_PUBLICKEYBYTES);   // [type][key][offer]
+    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);                  // [type][key][offer][sig]
+
+    vector<unsigned char> body = buildBody(peer, handshakePayload);
+
+    if (!sendFrame(sock, MsgType::HANDSHAKE, body))
+    {
+        return false;
+    }
+
+    s.state = SessionState::READY;
+
+    return true;
+}
+
+bool resendOffer(int sock, const Identity& me, const PeerId& peer, const Session& s)
+{
+    if (s.state != SessionState::OFFERED)
+    {
+        return false;
+    }
+
+    unsigned char sig[crypto_sign_BYTES];
+    if (!signOffer(me, peer.data(), s.pk, sig))
+    {
+        return false;
+    }
+
+    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::OFFER)};   // [type]
+    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [type][key]
+    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [type][key][sig]
+
+    vector<unsigned char> body = buildBody(peer, handshakePayload);
+    return sendFrame(sock, MsgType::HANDSHAKE, body);
+}
+
 bool startHandshake(int sock, const Identity& me, const PeerId& peer, Session& s)
 {
     wipeSession(s);
