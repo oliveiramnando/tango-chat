@@ -59,7 +59,8 @@ bool expectFrame(int sock, MsgType want, std::string& body, int timeoutMs = 2000
 
 // ---------- protocol steps ----------
 
-// Connects and runs the full login (CHALLENGE -> AUTH -> AUTH_OK -> USER_LIST).
+// Connects and runs the full login (CHALLENGE -> AUTH -> AUTH_OK -> USER_LIST, possibly
+// split over several frames).
 // On success, `online` holds the other users the server listed.
 // If the server refuses (e.g. already logged in), lastError() starts with "server rejected login".
 bool login(Bot& b, const std::string& host, int port, std::set<PeerId>* online = nullptr);

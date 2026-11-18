@@ -189,11 +189,21 @@ bool login(Bot& b, const string& host, int port, set<PeerId>* online)
         return false;
     }
 
-    // 1. the server's random challenge
+    // 1. the server's random challenge (or a refusal, e.g. "Server full.")
     string body;
-    if (!expectFrame(b.sock, MsgType::CHALLENGE, body))
+    MsgType first{};
+    if (!nextFrame(b.sock, first, body))
     {
         return false;
+    }
+    if (first == MsgType::ERROR_MSG)
+    {
+        b.disconnect();
+        return fail("server rejected login: " + body);
+    }
+    if (first != MsgType::CHALLENGE)
+    {
+        return fail("expected CHALLENGE, got frame type " + to_string(static_cast<int>(first)));
     }
     if (body.size() != CHALLENGE_BYTES)
     {
@@ -230,15 +240,19 @@ bool login(Bot& b, const string& host, int port, set<PeerId>* online)
     {
         return fail("expected AUTH_OK, got frame type " + to_string(static_cast<int>(type)));
     }
-    if (!expectFrame(b.sock, MsgType::USER_LIST, body))
-    {
-        return false;
-    }
-
+    // The list may be split over several USER_LIST frames; read until "no more follow".
     set<PeerId> ids;
-    if (!parseUserList(body, ids))
+    bool more = true;
+    while (more)
     {
-        return fail("invalid user list");
+        if (!expectFrame(b.sock, MsgType::USER_LIST, body))
+        {
+            return false;
+        }
+        if (!parseUserList(body, ids, more))
+        {
+            return fail("invalid user list");
+        }
     }
     if (online != nullptr)
     {

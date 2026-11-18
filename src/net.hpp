@@ -49,7 +49,11 @@ bool sendAll(int clientSocket, const char* buffer, size_t n);
 // turns off Nagle's algorithm on a TCP socket, so small frames are sent immediately instead of waiting (up to ~40 ms) for the previous one to be acknowledged.
 bool setNoDelay(int sock);
 
-bool parseUserList(const std::string& payload, std::set<PeerId>& ids);
+constexpr std::size_t USER_LIST_MAX_IDS = (MAX_MESSAGE_SIZE - 1 - 1) / 32;   // 255
+
+std::vector<std::vector<unsigned char>> buildUserListBodies(const std::vector<PeerId>& ids);
+
+bool parseUserList(const std::string& payload, std::set<PeerId>& ids, bool& more);
 
 bool parseBody(const std::string& body, PeerId& id, std::vector<unsigned char>& payload);
 std::vector<unsigned char> buildBody(const PeerId& id, const std::vector<unsigned char>& payload);

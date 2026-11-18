@@ -1,5 +1,8 @@
 #include "net.hpp"
+#include <algorithm>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <string>
@@ -9,10 +12,13 @@
 #include <array>
 #include <set>
 
-#include <netinet/in.h>    // IPPROTO_TCP
-#include <netinet/tcp.h>   // TCP_NODELAY
-
 using namespace std;
+
+bool setNoDelay(int sock)
+{
+    int on = 1;
+    return setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) == 0;
+}
 
 vector<unsigned char> buildLoginMessage(const array<unsigned char, CHALLENGE_BYTES>& challenge)
 {
@@ -59,29 +65,50 @@ bool sendAll(int clientSocket, const char* buffer, size_t n)
     return true;
 }
 
-bool setNoDelay(int sock)
+vector<vector<unsigned char>> buildUserListBodies(const vector<PeerId>& ids)
 {
-    int on = 1;
-    return setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) == 0;
+    vector<vector<unsigned char>> bodies;
+    size_t next = 0;
+    do
+    {
+        const size_t count = min(USER_LIST_MAX_IDS, ids.size() - next);
+        const bool more = next + count < ids.size();
+
+        vector<unsigned char> body;
+        body.reserve(1 + count * PeerId{}.size());
+        body.push_back(more ? 1 : 0);
+        for (size_t i = next; i < next + count; ++i)
+        {
+            body.insert(body.end(), ids[i].begin(), ids[i].end());
+        }
+
+        bodies.push_back(move(body));
+        next += count;
+    } while (next < ids.size());
+    
+    return bodies;
 }
 
-bool parseUserList(const string& payload, set<PeerId>& ids)
+bool parseUserList(const string& payload, set<PeerId>& ids, bool& more)
 {
     const size_t idSize = PeerId{}.size();
-    if (payload.size() % idSize != 0)
+    if (payload.empty() || (payload.size() - 1) % idSize != 0)
+    {
+        return false;   // no flag byte, or IDs not a multiple of 32 bytes
+    }
+    const unsigned char flag = static_cast<unsigned char>(payload[0]);
+    if (flag > 1)
     {
         return false;
     }
+    more = (flag == 1);
 
-    ids.clear();
-
-    for (size_t offset = 0; offset < payload.size(); offset += idSize)
+    for (size_t offset = 1; offset < payload.size(); offset += idSize)
     {
         PeerId id{};
         memcpy(id.data(), payload.data() + offset, idSize);
         ids.insert(id);
     }
-
     return true;
 }
 

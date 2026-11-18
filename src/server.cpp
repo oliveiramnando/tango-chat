@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <atomic>
 
 #include "net.hpp"
 #include "crypto.hpp"
@@ -58,7 +59,21 @@ struct Connection
 
 using ClientMap = map<PeerId, shared_ptr<Connection>>;   // logged-in user ID -> connection
 
+// A send blocked this long fails, and the client is dropped (see Connection::send).
 constexpr int SEND_TIMEOUT_MS = 2000;
+
+// new connection must finish logging in (send a valid AUTH) within this time
+constexpr int LOGIN_TIMEOUT_MS = 10000;
+
+constexpr int MAX_CONNECTIONS = 1000;
+atomic<int> activeConnections{0};
+
+// sets how long a receive on `sock` may wait (0 = forever)
+bool setReceiveTimeout(int sock, int ms)
+{
+    timeval t{ms / 1000, (ms % 1000) * 1000};
+    return setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(t)) == 0;
+}
 
 mutex clientsMutex;
 mutex coutMutex;
@@ -96,25 +111,31 @@ void rejectClient(Connection& conn, const string& reason)
     conn.send(MsgType::ERROR_MSG, msg);
 }
 
-
-vector<unsigned char> userListLocked(const PeerId& self, const ClientMap& clients)
+// Every logged-in ID except `self`, for the USER_LIST. Call with clientsMutex held.
+vector<PeerId> userIdsLocked(const PeerId& self, const ClientMap& clients)
 {
-    vector<unsigned char> payload;
-    payload.reserve(clients.size() * 32);
+    vector<PeerId> ids;
+    ids.reserve(clients.size());
     for (const auto& [id, conn] : clients)
     {
         if (id != self)
         {
-            payload.insert(payload.end(), id.begin(), id.end());
+            ids.push_back(id);
         }
     }
-    return payload;
+    return ids;
 }
 
 
 void clientHandler(int clientSocket, ClientMap& clients)
 {
+    // main() counted this connection; count it out however this function ends
+    struct Slot { ~Slot() { --activeConnections; } } slot;
+
     auto conn = make_shared<Connection>(clientSocket);
+
+    // until login is done, every receive gives up after LOGIN_TIMEOUT_MS
+    setReceiveTimeout(clientSocket, LOGIN_TIMEOUT_MS);
 
     // send challenge 
     array<unsigned char, CHALLENGE_BYTES> challenge{};
@@ -165,7 +186,7 @@ void clientHandler(int clientSocket, ClientMap& clients)
     unique_lock<mutex> loginFrames(conn->sendMutex);
 
     bool duplicate = false;
-    vector<unsigned char> userList;
+    vector<PeerId> userList;
     vector<shared_ptr<Connection>> others;   // who to tell that we're online
     {
         lock_guard<mutex> lock(clientsMutex);
@@ -175,7 +196,7 @@ void clientHandler(int clientSocket, ClientMap& clients)
         }
         else
         {
-            userList = userListLocked(clientId, clients);
+            userList = userIdsLocked(clientId, clients);
             others = othersLocked(clients, clientId);
             clients[clientId] = conn;
         }
@@ -188,8 +209,13 @@ void clientHandler(int clientSocket, ClientMap& clients)
         return;
     }
 
-    if (!conn->sendLocked(MsgType::AUTH_OK, {}) ||
-        !conn->sendLocked(MsgType::USER_LIST, userList))
+    // AUTH_OK, then the user list, split over as many USER_LIST frames as it needs
+    bool sent = conn->sendLocked(MsgType::AUTH_OK, {});
+    for (const auto& body : buildUserListBodies(userList))
+    {
+        sent = sent && conn->sendLocked(MsgType::USER_LIST, body);
+    }
+    if (!sent)
     {
         // noone was told we're online yet, so just take us out of the map again
         lock_guard<mutex> lock(clientsMutex);
@@ -197,6 +223,9 @@ void clientHandler(int clientSocket, ClientMap& clients)
         return;
     }
     loginFrames.unlock();
+
+    // logged in: a chat client may stay quiet for as long as it likes
+    setReceiveTimeout(clientSocket, 0);
 
     vector<unsigned char> idPayload(clientId.begin(), clientId.end());
     broadcast(others, MsgType::USER_ONLINE, idPayload);
@@ -373,6 +402,16 @@ int main(int argc, char* argv[])
         {
             perror("setsockopt(SO_SNDTIMEO)");
         }
+
+        if (activeConnections >= MAX_CONNECTIONS)
+        {
+            // turned away here, before a thread is started for it
+            const string reason = "Server full.";
+            sendFrame(clientSocket, MsgType::ERROR_MSG, vector<unsigned char>(reason.begin(), reason.end()));
+            close(clientSocket);
+            continue;
+        }
+        ++activeConnections;   // counted out by the handler's Slot
 
 		thread cli(clientHandler, clientSocket, ref(clients));
 		cli.detach();
