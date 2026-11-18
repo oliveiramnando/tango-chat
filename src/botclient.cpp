@@ -436,10 +436,32 @@ bool handshake(const Bot& a, Session& sa, const Bot& b, Session& sb)
 
 // ---------- messages ----------
 
-bool sendMessage(const Bot& from, const PeerId& to, const Session& s, const string& text)
+namespace
+{
+// opens a MESSAGE payload from `sender`, recording why if it fails
+optional<string> openFrom(const Bot& me, const PeerId& sender, Session& s, const vector<unsigned char>& payload)
+{
+    string plain;
+    uint64_t skipped = 0;
+    switch (openMessage(s, sender.data(), me.id.pk, string(payload.begin(), payload.end()), plain, skipped))
+    {
+        case OpenResult::OK:
+            return plain;
+        case OpenResult::REPLAYED:
+            fail("replayed or out-of-order message");
+            return nullopt;
+        case OpenResult::INVALID:
+        default:
+            fail("decrypt failed");
+            return nullopt;
+    }
+}
+}
+
+bool sendMessage(const Bot& from, const PeerId& to, Session& s, const string& text)
 {
     vector<unsigned char> encrypted;
-    if (!encrypt(text, encrypted, s.tx))
+    if (!sealMessage(s, from.id.pk, to.data(), text, encrypted))
     {
         return fail("encrypt failed");
     }
@@ -450,7 +472,7 @@ bool sendMessage(const Bot& from, const PeerId& to, const Session& s, const stri
     return true;
 }
 
-optional<string> receiveMessage(const Bot& me, const PeerId& expectedSender, const Session& s, int timeoutMs)
+optional<string> receiveMessage(const Bot& me, const PeerId& expectedSender, Session& s, int timeoutMs)
 {
     string body;
     if (!expectFrameFor(me, MsgType::MESSAGE, body, timeoutMs))
@@ -471,16 +493,10 @@ optional<string> receiveMessage(const Bot& me, const PeerId& expectedSender, con
         return nullopt;
     }
 
-    vector<unsigned char> plain;
-    if (!decrypt(plain, string(payload.begin(), payload.end()), s.rx))
-    {
-        fail("decrypt failed");
-        return nullopt;
-    }
-    return string(plain.begin(), plain.end());
+    return openFrom(me, expectedSender, s, payload);
 }
 
-optional<string> receiveMessageFromAny(const Bot& me, const map<PeerId, Session>& sessions,
+optional<string> receiveMessageFromAny(const Bot& me, map<PeerId, Session>& sessions,
                                        PeerId& sender, int timeoutMs)
 {
     string body;
@@ -502,13 +518,7 @@ optional<string> receiveMessageFromAny(const Bot& me, const map<PeerId, Session>
         return nullopt;
     }
 
-    vector<unsigned char> plain;
-    if (!decrypt(plain, string(payload.begin(), payload.end()), it->second.rx))
-    {
-        fail("decrypt failed");
-        return nullopt;
-    }
-    return string(plain.begin(), plain.end());
+    return openFrom(me, sender, it->second, payload);
 }
 
 } // namespace bot

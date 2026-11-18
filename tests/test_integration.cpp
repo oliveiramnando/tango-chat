@@ -483,3 +483,32 @@ TEST_CASE("integration: a user list longer than one frame (more than 255 users)"
     TestClient last;
     CHECK(login(last, server.port) == expected);
 }
+
+TEST_CASE("integration: a message delivered twice is rejected the second time")
+{
+    ServerProcess server;
+    REQUIRE_MESSAGE(server.ready, server.diagnosis());
+
+    TestClient alice, bob;
+    login(alice, server.port);
+    login(bob, server.port);
+    expectFrame(alice.sock, MsgType::USER_ONLINE);
+
+    Session aliceSession, bobSession;
+    REQUIRE_MESSAGE(bot::handshake(alice, aliceSession, bob, bobSession), bot::lastError());
+
+    // Seal one message and send the identical frame twice, as a server replaying it would.
+    vector<unsigned char> payload;
+    REQUIRE(sealMessage(aliceSession, alice.id.pk, bob.pid.data(), "alice : pay 10", payload));
+    vector<unsigned char> frameBody = buildBody(bob.pid, payload);
+    REQUIRE(sendFrame(alice.sock, MsgType::MESSAGE, frameBody));
+    REQUIRE(sendFrame(alice.sock, MsgType::MESSAGE, frameBody));
+
+    CHECK(bot::receiveMessage(bob, alice.pid, bobSession) == "alice : pay 10");
+    CHECK_FALSE(bot::receiveMessage(bob, alice.pid, bobSession).has_value());
+    CHECK(bot::lastError() == "replayed or out-of-order message");
+
+    // The conversation carries on normally afterwards.
+    REQUIRE(bot::sendMessage(alice, bob.pid, aliceSession, "alice : still here"));
+    CHECK(bot::receiveMessage(bob, alice.pid, bobSession) == "alice : still here");
+}

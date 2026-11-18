@@ -11,6 +11,11 @@
 constexpr std::size_t OFFER_PAYLOAD_SIZE = 1 + crypto_kx_PUBLICKEYBYTES + crypto_sign_BYTES;  // 97
 constexpr std::size_t REPLY_PAYLOAD_SIZE = 1 + crypto_kx_PUBLICKEYBYTES*2 + crypto_sign_BYTES;  // 129 
 
+// message payload: [8-byte counter][24-byte nonce][ciphertext][16-byte tag]
+// ad: "tcpchat-msg-v1" || sender ID || recipient ID || counter
+constexpr std::size_t MESSAGE_COUNTER_BYTES = 8;
+constexpr std::size_t MESSAGE_OVERHEAD = MESSAGE_COUNTER_BYTES + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + crypto_aead_xchacha20poly1305_ietf_ABYTES;  // 48
+
 struct Identity
 {
     unsigned char pk[crypto_sign_PUBLICKEYBYTES]{}; 
@@ -37,6 +42,16 @@ struct Session
     bool isInitiator = false;
 
     SessionState state = SessionState::NONE;
+
+    // message counters; reset whenever new session keys are derived
+    uint64_t txCounter = 0;   // number of the next message we send
+    uint64_t rxCounter = 0;   // lowest number we still accept from the peer
+};
+
+enum class OpenResult {
+    OK,         // genuine and new
+    INVALID,    // malformed, or failed authentication
+    REPLAYED,   // genuine, but already seen or out of order
 };
 
 bool loadOrCreateIdentity(const std::string& path, Identity& id);
@@ -60,7 +75,16 @@ void wipeSession(Session& s);
 
 std::string sessionFingerPrint(const Session& s);
 
-bool encrypt(const std::string& message, std::vector<unsigned char>& encrypted, const unsigned char* key);
-bool decrypt(std::vector<unsigned char>& decryptedMessage, const std::string& encryptedMessage, const unsigned char* key);
+// ad is authenticated but not encrypted
+bool encrypt(const std::string& message, std::vector<unsigned char>& encrypted, const unsigned char* key, const unsigned char* ad = nullptr, std::size_t adLen = 0);
+bool decrypt(std::vector<unsigned char>& decryptedMessage, const std::string& encryptedMessage, const unsigned char* key, const unsigned char* ad = nullptr, std::size_t adLen = 0);
+
+std::vector<unsigned char> buildMessageAd(const unsigned char* senderPk, const unsigned char* recipientPk, uint64_t counter);
+
+// encrypts as message number s.txCounter, then advances it
+bool sealMessage(Session& s, const unsigned char* myPk, const unsigned char* peerPk, const std::string& plain, std::vector<unsigned char>& payload);
+
+// authenticates first, then checks the number; on OK, skipped = how many earlier messages never arrived
+OpenResult openMessage(Session& s, const unsigned char* peerPk, const unsigned char* myPk, const std::string& payload, std::string& plain, uint64_t& skipped);
 
 #endif

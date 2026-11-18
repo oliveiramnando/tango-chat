@@ -14,6 +14,7 @@ constexpr std::size_t CHALLENGE_BYTES = 32;
 constexpr char LOGIN_LABEL[] = "tcpchat-login-v1";
 constexpr std::string_view OFFER_LABEL = "tcpchat-offer-v1";
 constexpr std::string_view REPLY_LABEL = "tcpchat-reply-v1";
+constexpr std::string_view MESSAGE_LABEL = "tcpchat-msg-v1";
 
 using PeerId = std::array<unsigned char, 32>;
 

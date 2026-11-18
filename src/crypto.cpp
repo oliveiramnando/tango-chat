@@ -211,6 +211,9 @@ bool deriveSessionKeys(Session &s, const string &peerPk)
 
     sodium_memzero(s.sk, crypto_kx_SECRETKEYBYTES);     // sk no longer used so wipe it
 
+    s.txCounter = 0;
+    s.rxCounter = 0;
+
     return true;
 }
 
@@ -229,6 +232,9 @@ void wipeSession(Session &s)
     s.isInitiator = false;
 
     s.state = SessionState::NONE;
+
+    s.txCounter = 0;
+    s.rxCounter = 0;
 }
 
 
@@ -270,7 +276,7 @@ string sessionFingerPrint(const Session& s)
 }
 
 
-bool encrypt(const string& message, vector<unsigned char>& encrypted, const unsigned char* key)
+bool encrypt(const string& message, vector<unsigned char>& encrypted, const unsigned char* key, const unsigned char* ad, size_t adLen)
 {
     encrypted.resize(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES + message.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
 
@@ -280,14 +286,14 @@ bool encrypt(const string& message, vector<unsigned char>& encrypted, const unsi
 
     if (crypto_aead_xchacha20poly1305_ietf_encrypt(encrypted.data() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES, nullptr, 
                                                 reinterpret_cast<const unsigned char*>(message.data()), message.size(), 
-                                                nullptr, 0, nullptr, nonce, key) != 0)
+                                                ad, adLen, nullptr, nonce, key) != 0)
     {
         return false;
     }
     return true;
 }
 
-bool decrypt(vector<unsigned char>& decryptedMessage, const string& encryptedMessage, const unsigned char* key)
+bool decrypt(vector<unsigned char>& decryptedMessage, const string& encryptedMessage, const unsigned char* key, const unsigned char* ad, size_t adLen)
 {
     // Nonce extraction
     unsigned char nonce[crypto_aead_xchacha20poly1305_ietf_NPUBBYTES];
@@ -304,7 +310,7 @@ bool decrypt(vector<unsigned char>& decryptedMessage, const string& encryptedMes
 
     // Decryption
     decryptedMessage.resize(messageTagLength - crypto_aead_xchacha20poly1305_ietf_ABYTES); // length of plaintext
-    if (crypto_aead_xchacha20poly1305_ietf_decrypt(decryptedMessage.data(), nullptr, nullptr, encrypted.data(), messageTagLength, nullptr, 0, nonce, key) != 0)
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(decryptedMessage.data(), nullptr, nullptr, encrypted.data(), messageTagLength, ad, adLen, nonce, key) != 0)
     {
         return false;
     }
@@ -312,4 +318,83 @@ bool decrypt(vector<unsigned char>& decryptedMessage, const string& encryptedMes
     return true;
 }
 
+// big-endian, so the byte order on the wire doesn't depend on the machine
+static void putCounter(unsigned char* out, uint64_t counter)
+{
+    for (int i = 7; i >= 0; --i)
+    {
+        out[i] = static_cast<unsigned char>(counter & 0xFF);
+        counter >>= 8;
+    }
+}
 
+static uint64_t getCounter(const unsigned char* in)
+{
+    uint64_t counter = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        counter = (counter << 8) | in[i];
+    }
+    return counter;
+}
+
+vector<unsigned char> buildMessageAd(const unsigned char* senderPk, const unsigned char* recipientPk, uint64_t counter)
+{
+    // label || sender ID || recipient ID || counter
+    vector<unsigned char> ad(MESSAGE_LABEL.begin(), MESSAGE_LABEL.end());
+    ad.insert(ad.end(), senderPk, senderPk + crypto_sign_PUBLICKEYBYTES);
+    ad.insert(ad.end(), recipientPk, recipientPk + crypto_sign_PUBLICKEYBYTES);
+
+    unsigned char c[MESSAGE_COUNTER_BYTES];
+    putCounter(c, counter);
+    ad.insert(ad.end(), c, c + MESSAGE_COUNTER_BYTES);
+    return ad;
+}
+
+bool sealMessage(Session& s, const unsigned char* myPk, const unsigned char* peerPk, const string& plain, vector<unsigned char>& payload)
+{
+    const uint64_t counter = s.txCounter;
+    const vector<unsigned char> ad = buildMessageAd(myPk, peerPk, counter);
+
+    vector<unsigned char> encrypted;
+    if (!encrypt(plain, encrypted, s.tx, ad.data(), ad.size()))
+    {
+        return false;
+    }
+
+    // [counter][nonce][ciphertext][tag]
+    payload.assign(MESSAGE_COUNTER_BYTES, 0);
+    putCounter(payload.data(), counter);
+    payload.insert(payload.end(), encrypted.begin(), encrypted.end());
+
+    ++s.txCounter;      // only once the message exists, so numbers have no gaps
+    return true;
+}
+
+OpenResult openMessage(Session& s, const unsigned char* peerPk, const unsigned char* myPk, const string& payload, string& plain, uint64_t& skipped)
+{
+    if (payload.size() < MESSAGE_OVERHEAD)
+    {
+        return OpenResult::INVALID;
+    }
+    const uint64_t counter = getCounter(reinterpret_cast<const unsigned char*>(payload.data()));
+
+    // authenticate first: only a genuine message may move the counter
+    const vector<unsigned char> ad = buildMessageAd(peerPk, myPk, counter);
+    vector<unsigned char> decrypted;
+    if (!decrypt(decrypted, payload.substr(MESSAGE_COUNTER_BYTES), s.rx, ad.data(), ad.size()))
+    {
+        return OpenResult::INVALID;
+    }
+
+    if (counter < s.rxCounter)
+    {
+        sodium_memzero(decrypted.data(), decrypted.size());
+        return OpenResult::REPLAYED;
+    }
+
+    skipped = counter - s.rxCounter;    // 0 in a normal conversation
+    s.rxCounter = counter + 1;
+    plain.assign(decrypted.begin(), decrypted.end());
+    return OpenResult::OK;
+}

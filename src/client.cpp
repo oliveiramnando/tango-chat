@@ -208,14 +208,25 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     }
 
                     // decrypt message here with sender's rx jey
-                    vector<unsigned char> decryptedMessage{};
-                    if(!decrypt(decryptedMessage, string(payload.begin(), payload.end()), it->second.rx))
+                    string nameAndMessage;
+                    uint64_t skipped = 0;
+                    OpenResult result = openMessage(it->second, sender.data(), id.pk, string(payload.begin(), payload.end()), nameAndMessage, skipped);
+                    if (result == OpenResult::INVALID)
                     {
                         cerr << "Failed to decrypt message." << endl;
                         redrawPrompt();
                         continue;
                     }
-                    string nameAndMessage(decryptedMessage.begin(), decryptedMessage.end());
+                    if (result == OpenResult::REPLAYED)
+                    {
+                        cerr << "Rejected a repeated or out-of-order message from " << displayName(contacts, sender) << "." << endl;
+                        redrawPrompt();
+                        continue;
+                    }
+                    if (skipped > 0)
+                    {
+                        cerr << "Warning: " << skipped << " earlier message(s) from " << displayName(contacts, sender) << " never arrived." << endl;
+                    }
 
                     size_t colonIdx = nameAndMessage.find(" : ");
                     if (colonIdx == string::npos)
@@ -743,7 +754,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 string message = name + " : " + inputBuffer; 
 
                 vector<unsigned char> encrypted{};
-                if (!encrypt(message, encrypted, it->second.tx))
+                if (!sealMessage(it->second, id.pk, currentPeer->data(), message, encrypted))
                 {
                     cerr << "Failed to encrypt" << endl;
                     redrawPrompt();

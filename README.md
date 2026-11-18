@@ -18,6 +18,7 @@ The server authenticates users and routes frames, but it never holds conversatio
 - **Signed offer/reply handshakes:** A conversation starts with a signed *offer* and is answered with a signed *reply* that names the offer it answers, so neither side ever has to guess what a handshake means. Both are bound to both users' IDs, and the receiver verifies the signature before touching any session, so forged, altered, redirected or stale handshakes are rejected and cannot disturb an existing conversation.
 - **Reliable connection setup:** If both people start a chat at the same moment, the two offers are resolved the same way on both sides. If a handshake gets no reply (for example because the peer had not added you yet), running `/chat` again sends a fresh offer straight away.
 - **End-to-end encryption:** XChaCha20-Poly1305 authenticated encryption with a fresh random 24-byte nonce for every message.
+- **Replay and reordering protection:** Every message carries a number that is authenticated together with both users' IDs. Repeated or out-of-order messages are rejected, and missing ones are reported.
 - **Ephemeral key exchange per conversation:** A new key pair for every session, with directional `rx`/`tx` keys derived using libsodium's `crypto_kx` API. Ephemeral secret keys are wiped as soon as session keys are derived, and session keys are wiped when the peer goes offline or is removed from your contacts.
 - **Session fingerprints:** After each handshake, both clients print a hash of the two ephemeral public keys, which can be compared as an extra check.
 - **Addressed, relay-only routing:** The server forwards only `HANDSHAKE` and `MESSAGE` frames, and only to the addressed recipient. It stamps every relayed frame with the authenticated sender's ID, so clients cannot impersonate each other. A client that sends any other frame type is disconnected.
@@ -93,8 +94,8 @@ make test
 
 This builds the server, then builds `run_tests` from every `tests/test_*.cpp` file with AddressSanitizer and UndefinedBehaviorSanitizer enabled, and runs it:
 
-- **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, the contacts file, and name and command parsing.
-- **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejected logins, offline recipients, a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
+- **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, message numbering (replays, gaps, altered counters and IDs), the contacts file, and name and command parsing.
+- **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejection of a message delivered twice, rejected logins, offline recipients, a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
 
 The sanitizers fail the run at the first out-of-bounds memory access or undefined behavior, even if every check would otherwise pass.
 
@@ -266,7 +267,7 @@ The file is rewritten in full on every `/add` and `/remove`. The client writes `
    Because both sides see the same two offer keys, crossed offers are always resolved the same way. Sending an offer again is harmless, since a copy the peer has already answered is ignored as a duplicate.
 7. Each client derives a **receive (`rx`)** and **transmit (`tx`)** key and wipes its ephemeral secret key. One side's `tx` equals the other side's `rx`. Both print the peer's name and a session fingerprint (a BLAKE2b hash of both ephemeral keys, in initiator-then-responder order).
 8. Running `/chat` again while an offer is unanswered sends a fresh offer immediately. A late reply to the old offer no longer matches and is ignored, so retrying is safe at any time.
-9. Messages (`name : message`) are encrypted with that peer's `tx` and a new random nonce, sent addressed to the peer, and decrypted by the recipient with its `rx` for the sender. The recipient displays the name it saved for the sender's ID and ignores the name inside the message. Messages from peers without a Ready session, or that fail authentication, are rejected.
+9. Messages (`name : message`) are numbered from 0 in each direction of each session, encrypted with that peer's `tx` and a new random nonce, sent addressed to the peer, and decrypted by the recipient with its `rx` for the sender (see [Encryption](#encryption)). The recipient displays the name it saved for the sender's ID and ignores the name inside the message. Messages from peers without a Ready session, that fail authentication, or that repeat an earlier number are rejected; if numbers are skipped, the recipient is warned that earlier messages never arrived.
 10. When a peer goes offline, or is removed from your contacts, the client wipes and removes that peer's session.
 
 ### Server Design
@@ -293,13 +294,13 @@ Each frame is encoded as:
 
 - **Length:** Unsigned 32-bit integer in network byte order, counting the type byte and body (not the length prefix itself). Frames shorter than 1 byte or longer than the maximum are rejected and the connection is closed.
 - **Type:** One of the values below.
-- **Limit:** The maximum frame length is **8,192 bytes**, including the type byte. The 32-byte peer ID and 40 bytes of encryption overhead leave room for about 8,100 bytes of plaintext per message, including the sender's chat name.
+- **Limit:** The maximum frame length is **8,192 bytes**, including the type byte. The 32-byte peer ID and 48 bytes of message overhead (counter, nonce and tag) leave room for about 8,100 bytes of plaintext per message, including the sender's chat name.
 
 Relayed frames carry an **addressed body**: `[32-byte peer ID][payload]`. From client to server, the ID is the **recipient**; the server replaces it with the authenticated **sender's** ID before forwarding. The server never inspects the payload.
 
 | Type | Value | Sent by | Body |
 | --- | --- | --- | --- |
-| `MESSAGE` | 1 | client (relayed) | `[peer ID][24-byte nonce][ciphertext][16-byte tag]` |
+| `MESSAGE` | 1 | client (relayed) | `[peer ID][8-byte counter][24-byte nonce][ciphertext][16-byte tag]` |
 | `HANDSHAKE` | 2 | client (relayed) | `[peer ID][payload]`; see below |
 | — | 3, 4 | — | Reserved (formerly `PEER_JOINED`/`PEER_LEFT`, no longer used) |
 | `ERROR_MSG` | 5 | server only | Error text (e.g. "Server full."), or the 32-byte ID of a recipient who is not online |
@@ -325,11 +326,27 @@ The `readNBytes()` and `sendAll()` helpers handle reads and writes that transfer
 
 ### Encryption
 
-`crypto.cpp` uses **XChaCha20-Poly1305** with a random **24-byte nonce** per message. The encrypted payload is structured as:
+`crypto.cpp` uses **XChaCha20-Poly1305** with a random **24-byte nonce** per message. A message payload is structured as:
 
 ```text
-[24-byte nonce][ciphertext][16-byte authentication tag]
+[8-byte counter][24-byte nonce][ciphertext][16-byte authentication tag]
 ```
+
+The **counter** numbers the messages in each direction of a session, starting at 0, and is sent in the clear (big-endian). It is protected as **additional data**: bytes that AEAD authenticates without encrypting. The additional data for each message is:
+
+```text
+"tcpchat-msg-v1" || sender ID || recipient ID || counter
+```
+
+so the tag only verifies if the counter, both IDs and the purpose of the data are exactly what the sender used. The recipient authenticates the message first and only then looks at its number:
+
+| Counter | Meaning | Result |
+| --- | --- | --- |
+| The next expected number | Normal | Accepted |
+| Higher than expected | Genuine, but earlier messages never arrived | Accepted, with a warning saying how many are missing |
+| Lower than expected | Already seen, or delivered out of order | Rejected |
+
+Because checking comes after authentication, forged data can't move the counter or be reported as a replay. Counters restart at 0 with every new handshake; messages from an earlier session can't be replayed into a new one, because they were encrypted with different keys.
 
 The tag lets the recipient reject any message that was altered, truncated or encrypted with a different key. Because each direction of each conversation has its own key, a message cannot be reflected back to its sender or replayed into a different conversation. The only key stored on disk is each profile's long-term identity key; all conversation keys exist only in memory for the length of a session.
 
@@ -343,7 +360,7 @@ tcp-chat/
 ├── src/
 │   ├── client.cpp          # Profiles, login, commands, per-peer sessions, terminal UI, send/receive threads
 │   ├── server.cpp          # Login verification, connections, user registry, presence, routing, limits
-│   ├── crypto.cpp          # Identity keys, login, offer and reply signing, session keys, fingerprints, AEAD helpers
+│   ├── crypto.cpp          # Identity keys, login, offer and reply signing, session keys, fingerprints, numbered AEAD messages
 │   ├── crypto.hpp          # Identity, Session and session states, payload sizes, cryptography declarations
 │   ├── contacts.cpp        # Contact rules, hex IDs, loading and safely saving the contacts file
 │   ├── contacts.hpp
@@ -357,7 +374,7 @@ tcp-chat/
 │   ├── doctest.h           # Test framework (single header)
 │   ├── test_main.cpp       # Initializes libsodium and runs all tests
 │   ├── test_net.cpp        # Framing, user-list splitting and parsing
-│   ├── test_crypto.cpp     # Offer and reply signing, key derivation, encryption
+│   ├── test_crypto.cpp     # Offer and reply signing, key derivation, encryption, message numbering
 │   ├── test_contacts.cpp   # Hex IDs, contact rules, saving and loading the contacts file
 │   ├── test_util.cpp       # Name validation and command parsing
 │   └── test_integration.cpp  # Real server over TCP: login, offers and replies, routing, long user lists, malformed frames
@@ -380,8 +397,7 @@ This is an experimental application, **not an audited or production-ready secure
 - **Contacts are only as good as the first fingerprint check:** The client trusts whatever ID you save with `/add`. If you add someone without comparing fingerprints, a malicious server could have shown you an identity it controls. Comparing fingerprints out of band once, before adding, is what makes a contact trustworthy.
 - **Old offers can be replayed:** A malicious server could resend an earlier, genuinely signed offer. The receiver treats it as the peer starting over and replies to it. The server cannot read any messages this way, because that offer's ephemeral secret was wiped long ago, but it would break the session until one side runs `/chat` again. Replayed *replies* are already rejected, since they no longer answer the current offer.
 - **Local files are protected only by permissions:** Each `identity.key` and `contacts` file is protected only by file and folder permissions (`0600` and `0700`). Anyone who can write to your profile folder could swap a contact's ID or steal your identity.
-- **No replay protection for messages:** A captured valid message could be re-sent, and messages could be dropped or reordered, without detection.
-- **Message type not bound to ciphertext:** The frame type is not yet included as authenticated additional data.
+- **Dropped messages are only noticed later:** If messages are withheld, the recipient is warned when the next message arrives, not before. The last messages of a conversation could be dropped without any warning.
 - **Limited protection against denial of service:** The login timeout and the 1,000-connection cap stop the simplest resource exhaustion, but there are no per-address limits or rate limits, so a determined client can still fill the server or flood other users.
 - **Metadata is visible to the server:** It sees who is online, who talks to whom, and message sizes and timing, though not message content.
 - **No offline delivery or history:** Messages to users who are not online are not stored, and no chat history is kept.
@@ -414,8 +430,7 @@ Do not rely on this project to protect sensitive information.
 - [ ] Freshness check for offers, so a replayed old offer is rejected
 - [ ] Split the client into a core and a front end, with unit tests for the handshake rules
 - [ ] Dedicated "user not found" frame type instead of `ERROR_MSG`
-- [ ] Bind the frame type to each ciphertext as authenticated additional data
-- [ ] Add message counters for replay and reordering detection
+- [x] Message counters and additional data: replayed, reordered and dropped messages are detected
 - [ ] Full-screen terminal UI
 - [ ] `make install`, standard config and data paths, releases and a Homebrew tap
 - [ ] Group chat

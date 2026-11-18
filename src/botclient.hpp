@@ -85,16 +85,16 @@ std::optional<std::string> receiveReply(const Bot& me, const PeerId& expectedSen
 bool handshake(const Bot& a, Session& sa, const Bot& b, Session& sb);
 
 // Encrypts `text` with s.tx and sends it to `to`.
-bool sendMessage(const Bot& from, const PeerId& to, const Session& s, const std::string& text);
+bool sendMessage(const Bot& from, const PeerId& to, Session& s, const std::string& text);
 
 // Receives a message from `expectedSender` and decrypts it with s.rx.
 std::optional<std::string> receiveMessage(const Bot& me, const PeerId& expectedSender,
-                                          const Session& s, int timeoutMs = 2000);
+                                          Session& s, int timeoutMs = 2000);
 
 // Receives a message from any peer in `sessions` and decrypts it with that peer's session.
 // `sender` is set to who sent it. Fails if the sender isn't in `sessions`.
 std::optional<std::string> receiveMessageFromAny(const Bot& me,
-                                                 const std::map<PeerId, Session>& sessions,
+                                                 std::map<PeerId, Session>& sessions,
                                                  PeerId& sender, int timeoutMs = 2000);
 
 } // namespace bot
