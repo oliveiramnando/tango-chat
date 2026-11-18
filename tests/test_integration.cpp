@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <csignal>
 #include <fstream>
+#include <memory>
 #include <sstream>
 #include <cstring>
 #include <set>
@@ -461,4 +462,24 @@ TEST_CASE("integration: malformed frames close that connection but not the serve
     TestClient dave;
     CHECK(login(dave, server.port) == set<PeerId>{bob.pid});
     CHECK(toPeerId(expectFrame(bob.sock, MsgType::USER_ONLINE)) == dave.pid);
+}
+
+TEST_CASE("integration: a user list longer than one frame (more than 255 users)")
+{
+    ServerProcess server;
+    REQUIRE_MESSAGE(server.ready, server.diagnosis());
+
+    // 300 users: before the user list was split, the 257th login failed.
+    constexpr int USERS = 300;
+    vector<unique_ptr<TestClient>> users;
+    set<PeerId> expected;
+    for (int i = 0; i < USERS; ++i)
+    {
+        users.push_back(make_unique<TestClient>());
+        login(*users.back(), server.port);
+        expected.insert(users.back()->pid);
+    }
+
+    TestClient last;
+    CHECK(login(last, server.port) == expected);
 }
