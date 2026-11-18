@@ -46,6 +46,9 @@ std::vector<unsigned char> buildLoginMessage(const std::array<unsigned char, CHA
 bool readNBytes(int clientSocket, char* buffer, size_t n);
 bool sendAll(int clientSocket, const char* buffer, size_t n);
 
+// turns off Nagle's algorithm on a TCP socket, so small frames are sent immediately instead of waiting (up to ~40 ms) for the previous one to be acknowledged.
+bool setNoDelay(int sock);
+
 bool parseUserList(const std::string& payload, std::set<PeerId>& ids);
 
 bool parseBody(const std::string& body, PeerId& id, std::vector<unsigned char>& payload);

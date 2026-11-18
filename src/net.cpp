@@ -9,6 +9,9 @@
 #include <array>
 #include <set>
 
+#include <netinet/in.h>    // IPPROTO_TCP
+#include <netinet/tcp.h>   // TCP_NODELAY
+
 using namespace std;
 
 vector<unsigned char> buildLoginMessage(const array<unsigned char, CHALLENGE_BYTES>& challenge)
@@ -54,6 +57,12 @@ bool sendAll(int clientSocket, const char* buffer, size_t n)
         bytesSent += dataSize;
     }
     return true;
+}
+
+bool setNoDelay(int sock)
+{
+    int on = 1;
+    return setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) == 0;
 }
 
 bool parseUserList(const string& payload, set<PeerId>& ids)
