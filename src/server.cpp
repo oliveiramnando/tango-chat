@@ -16,12 +16,28 @@
 #include <sodium.h>
 
 #include <map>
+#include <memory>
 
 #include "net.hpp"
 #include "crypto.hpp"
 
 using namespace std;
-using ClientMap = map<PeerId, int>;     // logged in userid -> socket; instead of clients vector
+
+struct Connection
+{
+    int sock;
+    mutex sendMutex;
+
+    explicit Connection(int s) : sock(s) {}
+
+    bool send(MsgType type, const vector<unsigned char>& body)
+    {
+        lock_guard<mutex> lock(sendMutex);
+        return sendFrame(sock, type, body);
+    }
+};
+
+using ClientMap = map<PeerId, shared_ptr<Connection>>;   // logged-in user ID -> connection
 
 mutex clientsMutex;
 mutex coutMutex;
@@ -33,7 +49,7 @@ void rejectClient(int clientSocket, const string& reason)
     close(clientSocket);
 }
 
-bool sendUserList(int clientSocket, const PeerId& selfId, const ClientMap& inputMap)
+bool sendUserList(Connection& conn, const PeerId& selfId, const ClientMap& inputMap)
 {
     vector<unsigned char> payload;
     payload.reserve(inputMap.size() * 32);
@@ -43,18 +59,20 @@ bool sendUserList(int clientSocket, const PeerId& selfId, const ClientMap& input
         payload.insert(payload.end(), cli.first.begin(), cli.first.end());
     }
 
-    return sendFrame(clientSocket, MsgType::USER_LIST, payload);
+    return conn.send(MsgType::USER_LIST, payload);
 }
 
 
 void clientHandler(int clientSocket, ClientMap& clients)
 {
+    auto conn = make_shared<Connection>(clientSocket);
+
     // send challenge 
     array<unsigned char, CHALLENGE_BYTES> challenge{};
     randombytes_buf(challenge.data(), challenge.size());
 
     vector<unsigned char> challengePayload(challenge.begin(), challenge.end());
-    if (!sendFrame(clientSocket, MsgType::CHALLENGE, challengePayload))
+    if (!conn->send(MsgType::CHALLENGE, challengePayload))
     {
         lock_guard<mutex> lock(coutMutex);
         cerr << "Failed to send challenge to client" << endl;
@@ -104,15 +122,15 @@ void clientHandler(int clientSocket, ClientMap& clients)
             return;
         }
 
-        if (!sendFrame(clientSocket, MsgType::AUTH_OK, {}))
+        if (!conn->send(MsgType::AUTH_OK, {}))
         {
             close(clientSocket);
             return;
         }
 
-        clients[clientId] = clientSocket;
+        clients[clientId] = conn;
         // send user list of all clients
-        if (!sendUserList(clientSocket, clientId, clients))
+        if (!sendUserList(*conn, clientId, clients))
         {   
             clients.erase(clientId);
             close(clientSocket);
@@ -121,10 +139,10 @@ void clientHandler(int clientSocket, ClientMap& clients)
 
         // send every other user that the curr user is online 
         vector<unsigned char> idPayload(clientId.begin(), clientId.end());
-        for (const auto & [otherId, otherSocket] : clients)
+        for (const auto & [otherId, other] : clients)
 	    {
             if (otherId == clientId) { continue; }
-	    	if (!sendFrame(otherSocket, MsgType::USER_ONLINE, idPayload))
+	    	if (!other->send(MsgType::USER_ONLINE, idPayload))
 	    	{
                 lock_guard<mutex> lock(coutMutex);
 	    		cerr << "Failed to send message to client" << endl;
@@ -166,27 +184,28 @@ void clientHandler(int clientSocket, ClientMap& clients)
         
         vector<unsigned char> sendBody = buildBody(clientId, encrypted);
 
-        int recipientSocket = -1;
+        // copy recipient's shared_ptr under the lock, then send without it; the copy keeps the Connection alive even if the recipient leaves
+        shared_ptr<Connection> recipient;
         {
             lock_guard<mutex> lock(clientsMutex);
             auto it = clients.find(recipientId);
             if (it != clients.end())
             {   
-                recipientSocket = it->second;
+                recipient = it->second;
             }
         }
 
-        if (recipientSocket < 0)
+        if (!recipient)
         {
             vector<unsigned char> missingId(recipientId.begin(), recipientId.end());
-            if (!sendFrame(clientSocket, MsgType::ERROR_MSG, missingId))
+            if (!conn->send(MsgType::ERROR_MSG, missingId))
             {
                 break;
             }
             continue;
         }
 
-        if (!sendFrame(recipientSocket, type, sendBody))
+        if (!recipient->send(type, sendBody))
         {
             cerr << "Failed to send message to client" << endl;
         }
@@ -198,9 +217,9 @@ void clientHandler(int clientSocket, ClientMap& clients)
 
         // send USER OFFLINE to remaining clients
         vector<unsigned char> idPayload(clientId.begin(), clientId.end());
-        for (const auto & [otherId, otherSocket] : clients)
+        for (const auto & [otherId, other] : clients)
 	    {
-	    	if (!sendFrame(otherSocket, MsgType::USER_OFFLINE, idPayload))
+	    	if (!other->send(MsgType::USER_OFFLINE, idPayload))
 	    	{
                 lock_guard<mutex> lock(coutMutex);
 	    		cerr << "Failed to send message to client" << endl;
