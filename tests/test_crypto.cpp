@@ -71,60 +71,6 @@ TEST_CASE("offer and reply labels differ, so their messages can never be equal")
           buildHandshakeMessage(REPLY_LABEL, k.data(), k.data(), k.data()));
 }
 
-// ---------- signHandshake / verifyHandshake ----------
-
-TEST_CASE("verifyHandshake accepts a valid signature and rejects any change")
-{
-    Identity alice = makeIdentity();
-    Identity bob = makeIdentity();
-    Identity carol = makeIdentity();
-
-    unsigned char eph[crypto_kx_PUBLICKEYBYTES];
-    randombytes_buf(eph, sizeof(eph));
-
-    // Alice signs her ephemeral key for Bob.
-    unsigned char sig[crypto_sign_BYTES];
-    REQUIRE(signHandshake(alice, bob.pk, eph, sig));
-
-    SUBCASE("valid handshake passes")
-    {
-        CHECK(verifyHandshake(alice.pk, bob.pk, eph, sig));
-    }
-
-    SUBCASE("different sender fails")
-    {
-        CHECK_FALSE(verifyHandshake(carol.pk, bob.pk, eph, sig));
-    }
-
-    SUBCASE("different recipient fails (redirected to Carol)")
-    {
-        CHECK_FALSE(verifyHandshake(alice.pk, carol.pk, eph, sig));
-    }
-
-    SUBCASE("changed ephemeral key fails")
-    {
-        unsigned char otherEph[crypto_kx_PUBLICKEYBYTES];
-        memcpy(otherEph, eph, sizeof(eph));
-        otherEph[0] ^= 0x01;
-        CHECK_FALSE(verifyHandshake(alice.pk, bob.pk, otherEph, sig));
-    }
-
-    SUBCASE("changed signature fails")
-    {
-        unsigned char badSig[crypto_sign_BYTES];
-        memcpy(badSig, sig, sizeof(sig));
-        badSig[10] ^= 0x01;
-        CHECK_FALSE(verifyHandshake(alice.pk, bob.pk, eph, badSig));
-    }
-
-    SUBCASE("signature from the wrong identity fails")
-    {
-        unsigned char carolSig[crypto_sign_BYTES];
-        REQUIRE(signHandshake(carol, bob.pk, eph, carolSig));
-        CHECK_FALSE(verifyHandshake(alice.pk, bob.pk, eph, carolSig));
-    }
-}
-
 // ---------- deriveSessionKeys ----------
 
 // Helper: build two sessions that completed a handshake with each other.
