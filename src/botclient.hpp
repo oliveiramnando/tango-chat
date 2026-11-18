@@ -8,6 +8,7 @@
 // and records why in bot::lastError(), so callers decide what a failure means:
 // the tests turn it into a failed REQUIRE, the load generator counts it.
 
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -60,6 +61,7 @@ bool expectFrame(int sock, MsgType want, std::string& body, int timeoutMs = 2000
 
 // Connects and runs the full login (CHALLENGE -> AUTH -> AUTH_OK -> USER_LIST).
 // On success, `online` holds the other users the server listed.
+// If the server refuses (e.g. already logged in), lastError() starts with "server rejected login".
 bool login(Bot& b, const std::string& host, int port, std::set<PeerId>* online = nullptr);
 
 // Sends a signed offer from `from` to `to`. Leaves `s` in OFFERED.
@@ -87,6 +89,12 @@ bool sendMessage(const Bot& from, const PeerId& to, const Session& s, const std:
 // Receives a message from `expectedSender` and decrypts it with s.rx.
 std::optional<std::string> receiveMessage(const Bot& me, const PeerId& expectedSender,
                                           const Session& s, int timeoutMs = 2000);
+
+// Receives a message from any peer in `sessions` and decrypts it with that peer's session.
+// `sender` is set to who sent it. Fails if the sender isn't in `sessions`.
+std::optional<std::string> receiveMessageFromAny(const Bot& me,
+                                                 const std::map<PeerId, Session>& sessions,
+                                                 PeerId& sender, int timeoutMs = 2000);
 
 } // namespace bot
 

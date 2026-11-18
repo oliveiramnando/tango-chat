@@ -31,6 +31,7 @@ bool fail(const string& why)
 }
 
 constexpr size_t KEY_LEN = crypto_kx_PUBLICKEYBYTES;   // 32
+constexpr int SEND_TIMEOUT_MS = 5000;   // a send blocked this long counts as failed
 }
 
 const string& lastError()
@@ -105,6 +106,11 @@ int connectTo(const string& host, int port, int recvTimeoutMs)
     // Never block forever in the middle of a frame.
     timeval timeout{recvTimeoutMs / 1000, (recvTimeoutMs % 1000) * 1000};
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    // Same for sending: if the server stops reading from us (stuck, or blocked on someone
+    // else), a send would otherwise wait forever and hang the whole program.
+    timeval sendTimeout{SEND_TIMEOUT_MS / 1000, (SEND_TIMEOUT_MS % 1000) * 1000};
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
     return s;
 }
 
@@ -209,10 +215,20 @@ bool login(Bot& b, const string& host, int port, set<PeerId>* online)
         return fail("could not send AUTH");
     }
 
-    // 3. accepted, then the list of who else is online
-    if (!expectFrame(b.sock, MsgType::AUTH_OK, body))
+    // 3. accepted (or refused, with the reason), then the list of who else is online
+    MsgType type{};
+    if (!nextFrame(b.sock, type, body))
     {
         return false;
+    }
+    if (type == MsgType::ERROR_MSG)
+    {
+        b.disconnect();
+        return fail("server rejected login: " + body);
+    }
+    if (type != MsgType::AUTH_OK)
+    {
+        return fail("expected AUTH_OK, got frame type " + to_string(static_cast<int>(type)));
     }
     if (!expectFrame(b.sock, MsgType::USER_LIST, body))
     {
@@ -443,6 +459,37 @@ optional<string> receiveMessage(const Bot& me, const PeerId& expectedSender, con
 
     vector<unsigned char> plain;
     if (!decrypt(plain, string(payload.begin(), payload.end()), s.rx))
+    {
+        fail("decrypt failed");
+        return nullopt;
+    }
+    return string(plain.begin(), plain.end());
+}
+
+optional<string> receiveMessageFromAny(const Bot& me, const map<PeerId, Session>& sessions,
+                                       PeerId& sender, int timeoutMs)
+{
+    string body;
+    if (!expectFrameFor(me, MsgType::MESSAGE, body, timeoutMs))
+    {
+        return nullopt;
+    }
+
+    vector<unsigned char> payload;
+    if (!parseBody(body, sender, payload))
+    {
+        fail("malformed message body");
+        return nullopt;
+    }
+    auto it = sessions.find(sender);
+    if (it == sessions.end())
+    {
+        fail("message from an unexpected sender");
+        return nullopt;
+    }
+
+    vector<unsigned char> plain;
+    if (!decrypt(plain, string(payload.begin(), payload.end()), it->second.rx))
     {
         fail("decrypt failed");
         return nullopt;
