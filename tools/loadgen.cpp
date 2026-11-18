@@ -12,11 +12,15 @@
 // constantly closed and reused under traffic. Churn traffic is checked for correctness only:
 // every login must see the right frames, and nobody may receive someone else's messages.
 //
+// STALLED (optional, --stalled S). S receivers that log in and then never read again, while
+// their sender floods them, so the server's socket buffers towards them fill up. Any send to
+// them then blocks. A server must not let one such client hold up everyone else.
+//
 // Each message's plaintext is a "probe":
 //   [8-byte send time (ns)][8-byte sequence number][padding up to the message size]
 //
 // Usage: ./loadgen [--host H] [--port N] [--pairs N] [--fanin K] [--messages N]
-//                  [--size N] [--rate N] [--churn C]
+//                  [--size N] [--rate N] [--churn C] [--stalled S]
 //        ./loadgen --help
 
 #include <sodium.h>
@@ -59,6 +63,11 @@ constexpr uint64_t LATE_NS = 1'000'000;   // 1 ms
 constexpr int CHURN_HOLD_MIN_MS = 2;
 constexpr int CHURN_HOLD_MAX_MS = 10;
 constexpr int CHURN_SEND_GAP_US = 20;     // pause between a churn sender's messages
+
+// Stalled: each stalled receiver's sender sends this many large messages, then stops.
+// 1,000 x 8,000 bytes = 8 MB, more than the socket buffers between server and receiver hold.
+constexpr int STALL_MESSAGES = 1000;
+constexpr size_t STALL_SIZE = 8000;
 
 // ---------- probes ----------
 
@@ -105,6 +114,7 @@ struct Config
     size_t size = 64;       // plaintext bytes per message
     double rate = 0;        // messages per second per sender; 0 = as fast as possible
     int churn = 0;          // extra pairs whose receiver keeps reconnecting
+    int stalled = 0;        // extra receivers that never read
 
     int warmupMessages() const { return static_cast<int>(messages * WARMUP_FRACTION); }
     bool paced() const { return rate > 0; }
@@ -303,6 +313,7 @@ struct Churner
     // churn sender thread
     int sent = 0;
     int misdelivered = 0;            // MESSAGE frames alice received (should be 0)
+    int sendFailures = 0;            // 1 if alice's send failed (the server stopped reading her)
     string sendError;
 
     // churn receiver thread
@@ -320,7 +331,7 @@ struct Churner
             reasons.push_back(why);
         }
     }
-    int failures() const { return misdelivered + loginFailures + receiveFailures; }
+    int failures() const { return misdelivered + sendFailures + loginFailures + receiveFailures; }
 };
 
 void runChurnSender(Churner& c, const atomic<bool>& stop, latch& go)
@@ -334,6 +345,7 @@ void runChurnSender(Churner& c, const atomic<bool>& stop, latch& go)
         if (!bot::sendMessage(c.alice, c.bob.pid, c.aliceSession, makeProbe(seq++, nowNs(), 64)))
         {
             c.sendError = bot::lastError();
+            ++c.sendFailures;   // blocked for 5 s: the server stopped reading from alice
             return;
         }
         ++c.sent;
@@ -403,12 +415,38 @@ void runChurnReceiver(Churner& c, const Config& cfg, const atomic<bool>& stop, l
     }
 }
 
+// ---------- stalled receivers ----------
+
+// A receiver that never reads after login, and a sender that floods it.
+// Their own results don't count: what matters is whether everyone ELSE keeps working.
+struct Staller
+{
+    bot::Bot alice;
+    bot::Bot bob;              // never read from during the run
+    Session aliceSession;
+    Session bobSession;
+};
+
+void runStaller(Staller& st, latch& go)
+{
+    go.wait();
+    for (int i = 0; i < STALL_MESSAGES; ++i)
+    {
+        drainIncoming(st.alice);
+        if (!bot::sendMessage(st.alice, st.bob.pid, st.aliceSession,
+                              makeProbe(i, nowNs(), STALL_SIZE)))
+        {
+            return;   // expected: the server stops reading alice while bob is stuck
+        }
+    }
+}
+
 // ---------- setup ----------
 
 // Logs every bot in, waits for the presence announcements, and handshakes everyone.
 // Returns false (after printing why) if anything fails.
 bool setUp(vector<unique_ptr<Group>>& groups, vector<unique_ptr<Churner>>& churners,
-           const Config& cfg)
+           vector<unique_ptr<Staller>>& stallers, const Config& cfg)
 {
     // 1. Log everyone in, one after another.
     vector<bot::Bot*> loginOrder;
@@ -424,6 +462,11 @@ bool setUp(vector<unique_ptr<Group>>& groups, vector<unique_ptr<Churner>>& churn
     {
         loginOrder.push_back(&c->alice);
         loginOrder.push_back(&c->bob);
+    }
+    for (auto& st : stallers)
+    {
+        loginOrder.push_back(&st->alice);
+        loginOrder.push_back(&st->bob);
     }
     for (size_t k = 0; k < loginOrder.size(); ++k)
     {
@@ -493,6 +536,14 @@ bool setUp(vector<unique_ptr<Group>>& groups, vector<unique_ptr<Churner>>& churn
             return false;
         }
     }
+    for (auto& st : stallers)
+    {
+        if (!bot::handshake(st->alice, st->aliceSession, st->bob, st->bobSession))
+        {
+            cerr << "stalled handshake failed: " << bot::lastError() << "\n";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -502,7 +553,7 @@ bool setUp(vector<unique_ptr<Group>>& groups, vector<unique_ptr<Churner>>& churn
 // finish; churn keeps going until then and is stopped afterwards.
 // Returns the steady-clock time (ns) at which the threads were released.
 uint64_t runLoad(vector<unique_ptr<Group>>& groups, vector<unique_ptr<Churner>>& churners,
-                 const Config& cfg)
+                 vector<unique_ptr<Staller>>& stallers, const Config& cfg)
 {
     // The latch holds every thread at the start line until the main thread counts it down,
     // so nobody gets a head start while the others are still being created.
@@ -524,6 +575,10 @@ uint64_t runLoad(vector<unique_ptr<Group>>& groups, vector<unique_ptr<Churner>>&
     {
         churn.emplace_back(runChurnSender, ref(*c), cref(stop), ref(go));
         churn.emplace_back(runChurnReceiver, ref(*c), cref(cfg), cref(stop), ref(go), seed++);
+    }
+    for (auto& st : stallers)
+    {
+        churn.emplace_back(runStaller, ref(*st), ref(go));   // joined with the churn threads
     }
 
     const uint64_t startNs = nowNs();
@@ -582,11 +637,12 @@ struct Summary
     // churn (correctness only)
     int churnSent = 0, churnReceived = 0, reconnects = 0, rejected = 0;
     int churnLoginFailures = 0, churnReceiveFailures = 0, churnMisdelivered = 0;
+    int churnSendFailures = 0;
     vector<string> churnReasons;
 
     int churnFailures() const
     {
-        return churnLoginFailures + churnReceiveFailures + churnMisdelivered;
+        return churnLoginFailures + churnReceiveFailures + churnMisdelivered + churnSendFailures;
     }
     bool clean() const
     {
@@ -681,6 +737,7 @@ Summary summarize(const vector<unique_ptr<Group>>& groups,
         s.churnLoginFailures += c->loginFailures;
         s.churnReceiveFailures += c->receiveFailures;
         s.churnMisdelivered += c->misdelivered;
+        s.churnSendFailures += c->sendFailures;
         for (const string& why : c->reasons)
         {
             if (s.churnReasons.size() < 5)
@@ -755,6 +812,11 @@ void printReport(const Summary& s, const Config& cfg)
         printf("churn       %d pairs, receiver reconnects every %d-%d ms\n",
                cfg.churn, CHURN_HOLD_MIN_MS, CHURN_HOLD_MAX_MS);
     }
+    if (cfg.stalled > 0)
+    {
+        printf("stalled     %d receivers that never read, each flooded with %d x %zu bytes\n",
+               cfg.stalled, STALL_MESSAGES, STALL_SIZE);
+    }
 
     // Correctness first: performance numbers mean nothing if messages went astray.
     printf("delivery    %d / %d delivered   errors: %d send, %d receive   "
@@ -768,9 +830,9 @@ void printReport(const Summary& s, const Config& cfg)
     if (cfg.churn > 0)
     {
         printf("churn       %d reconnects (%d refused as still logged in), %d sent, %d received"
-               "   failures: %d login, %d receive, %d misdelivered\n",
+               "   failures: %d login, %d receive, %d misdelivered, %d senders stuck\n",
                s.reconnects, s.rejected, s.churnSent, s.churnReceived, s.churnLoginFailures,
-               s.churnReceiveFailures, s.churnMisdelivered);
+               s.churnReceiveFailures, s.churnMisdelivered, s.churnSendFailures);
         for (const string& why : s.churnReasons)
         {
             printf("              e.g. %s\n", why.c_str());
@@ -814,10 +876,10 @@ void printReport(const Summary& s, const Config& cfg)
     }
 
     // One line with everything, for scripts: ./loadgen ... | grep '^summary'
-    printf("summary pairs=%d fanin=%d messages=%d size=%zu rate=%.0f churn=%d ok=%d "
+    printf("summary pairs=%d fanin=%d messages=%d size=%zu rate=%.0f churn=%d stalled=%d ok=%d "
            "delivered=%d missing=%d lost=%d ooo=%d misdelivered=%d errors=%d churn_failures=%d "
            "late=%d throughput=%.0f p50_us=%.1f p99_us=%.1f max_us=%.1f\n",
-           cfg.groups, cfg.fanin, cfg.messages, cfg.size, cfg.rate, cfg.churn,
+           cfg.groups, cfg.fanin, cfg.messages, cfg.size, cfg.rate, cfg.churn, cfg.stalled,
            s.clean() ? 1 : 0, s.delivered, s.missing, s.lost, s.outOfOrder, s.misdelivered,
            s.sendErrors + s.receiveErrors, s.churnFailures(), s.late, s.throughput,
            us(percentile(s.latencies, 50)), us(percentile(s.latencies, 99)),
@@ -838,6 +900,7 @@ void printUsage(const char* program)
            "  --size N        bytes per message, >= %zu                (default %zu)\n"
            "  --rate N        msg/s per sender, 0 = as fast as possible (default 0)\n"
            "  --churn C       extra pairs whose receiver keeps reconnecting (default 0)\n"
+           "  --stalled S     extra receivers that never read           (default 0)\n"
            "  --help          show this\n",
            program, d.host.c_str(), d.port, d.groups, d.fanin, d.messages, PROBE_HEADER,
            d.size);
@@ -873,6 +936,7 @@ bool parseOptions(int argc, char* argv[], Config& cfg)
             else if (name == "--size")     { cfg.size = stoul(value, &used); }
             else if (name == "--rate")     { cfg.rate = stod(value, &used); }
             else if (name == "--churn")    { cfg.churn = stoi(value, &used); }
+            else if (name == "--stalled")  { cfg.stalled = stoi(value, &used); }
             else
             {
                 cerr << "unknown option " << name << " (see --help)\n";
@@ -891,10 +955,10 @@ bool parseOptions(int argc, char* argv[], Config& cfg)
     }
 
     if (cfg.groups < 1 || cfg.fanin < 1 || cfg.messages < 1 || cfg.size < PROBE_HEADER ||
-        cfg.rate < 0 || cfg.churn < 0)
+        cfg.rate < 0 || cfg.churn < 0 || cfg.stalled < 0)
     {
         cerr << "need pairs >= 1, fanin >= 1, messages >= 1, size >= " << PROBE_HEADER
-             << ", rate >= 0, churn >= 0\n";
+             << ", rate >= 0, churn >= 0, stalled >= 0\n";
         return false;
     }
     return true;
@@ -936,12 +1000,17 @@ int main(int argc, char* argv[])
     {
         churners.push_back(make_unique<Churner>());
     }
+    vector<unique_ptr<Staller>> stallers;
+    for (int i = 0; i < cfg.stalled; ++i)
+    {
+        stallers.push_back(make_unique<Staller>());
+    }
 
-    if (!setUp(groups, churners, cfg))
+    if (!setUp(groups, churners, stallers, cfg))
     {
         return 1;
     }
-    const uint64_t startNs = runLoad(groups, churners, cfg);
+    const uint64_t startNs = runLoad(groups, churners, stallers, cfg);
     const Summary summary = summarize(groups, churners, cfg, startNs);
     printReport(summary, cfg);
 
