@@ -5,3 +5,4 @@ identity.key
 *.dSYM
 profiles/
 server_test.log
+server.log
