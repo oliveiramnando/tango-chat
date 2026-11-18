@@ -25,6 +25,11 @@ struct Bot
     PeerId pid{};         // the same public key, as the ID the server uses
     int sock = -1;        // -1 = not connected
 
+    // If true, the receive functions below silently skip USER_ONLINE / USER_OFFLINE frames.
+    // The tests leave it off (they check presence explicitly); the load generator turns it on,
+    // because other bots, even from an earlier run, can come and go at any moment.
+    bool ignorePresence = false;
+
     Bot();                                    // brand-new random identity
     explicit Bot(const Identity& existing);   // reuse an identity (e.g. to test duplicate logins)
     ~Bot();                                   // closes the socket

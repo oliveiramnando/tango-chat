@@ -145,6 +145,36 @@ bool expectFrame(int sock, MsgType want, string& body, int timeoutMs)
 
 // ---------- login ----------
 
+// ---------- receiving as a bot ----------
+
+namespace
+{
+bool isPresence(MsgType type)
+{
+    return type == MsgType::USER_ONLINE || type == MsgType::USER_OFFLINE;
+}
+
+// expectFrame for a bot: skips presence frames first if the bot asked for that.
+bool expectFrameFor(const Bot& me, MsgType want, string& body, int timeoutMs = 2000)
+{
+    MsgType type{};
+    do
+    {
+        if (!nextFrame(me.sock, type, body, timeoutMs))
+        {
+            return false;
+        }
+    } while (me.ignorePresence && isPresence(type) && !isPresence(want));
+
+    if (type != want)
+    {
+        return fail("expected frame type " + to_string(static_cast<int>(want)) +
+                    ", got " + to_string(static_cast<int>(type)));
+    }
+    return true;
+}
+}
+
 bool login(Bot& b, const string& host, int port, set<PeerId>* online)
 {
     b.sock = connectTo(host, port);
@@ -215,7 +245,7 @@ bool isInitiator(const Bot& me, const PeerId& peer)
 bool receiveHandshake(const Bot& me, const PeerId& expectedSender, vector<unsigned char>& payload)
 {
     string body;
-    if (!expectFrame(me.sock, MsgType::HANDSHAKE, body))
+    if (!expectFrameFor(me, MsgType::HANDSHAKE, body))
     {
         return false;
     }
@@ -393,7 +423,7 @@ bool sendMessage(const Bot& from, const PeerId& to, const Session& s, const stri
 optional<string> receiveMessage(const Bot& me, const PeerId& expectedSender, const Session& s, int timeoutMs)
 {
     string body;
-    if (!expectFrame(me.sock, MsgType::MESSAGE, body, timeoutMs))
+    if (!expectFrameFor(me, MsgType::MESSAGE, body, timeoutMs))
     {
         return nullopt;
     }
