@@ -391,7 +391,8 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                 {
                     lock_guard<mutex> lockTerm(terminalMutex);
                     lock_guard<mutex> lockUid(userIdsMutex);
-                    if (!parseUserList(body, userIds))
+                    bool more = false;
+                    if (!parseUserList(body, userIds, more))
                     {
                         cerr << "Failed to parse list of online users." << endl;
                         redrawPrompt();
