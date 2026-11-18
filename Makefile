@@ -17,7 +17,9 @@ CLIENT_HDRS = src/util.hpp src/contacts.hpp
 TEST_FLAGS = $(CXXFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all
 TEST_SRCS  = $(wildcard tests/test_*.cpp)
 
-LOADGEN_FLAGS = -std=c++20 -Wall -Wextra -O2 -Isrc
+# The load generator is built optimised and without sanitizers,
+# because we want to measure the server, not the tool's own overhead.
+LOADGEN_FLAGS = -std=c++20 -Wall -Wextra -O2 -pthread -Isrc
 
 all: server client
 
