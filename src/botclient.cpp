@@ -94,6 +94,14 @@ int connectTo(const string& host, int port, int recvTimeoutMs)
         return -1;
     }
 
+    // Send small frames immediately (see setNoDelay in net.hpp).
+    if (!setNoDelay(s))
+    {
+        close(s);
+        fail("setsockopt(TCP_NODELAY) failed");
+        return -1;
+    }
+
     // Never block forever in the middle of a frame.
     timeval timeout{recvTimeoutMs / 1000, (recvTimeoutMs % 1000) * 1000};
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));

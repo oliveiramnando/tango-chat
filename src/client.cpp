@@ -904,6 +904,11 @@ int main(int argc, char* argv[])
 		return 1;
     }
 
+    if (!setNoDelay(clientSocket))
+    {
+        cerr << "Warning: could not set TCP_NODELAY" << endl;
+    }
+
     cout << "Connected to server" << endl;
 
     MsgType type;

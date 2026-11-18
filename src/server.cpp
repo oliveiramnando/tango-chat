@@ -300,6 +300,11 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        if (!setNoDelay(clientSocket))
+        {
+            perror("setsockopt(TCP_NODELAY)");
+        }
+
 		thread cli(clientHandler, clientSocket, ref(clients));
 		cli.detach();
     }
