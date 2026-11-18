@@ -27,8 +27,6 @@
 #include <filesystem>
 #include <cctype>
 
-#include <chrono>
-
 #include "net.hpp"
 #include "crypto.hpp"
 #include "util.hpp"
@@ -43,8 +41,6 @@ termios origTerminal{};
 atomic<bool> quitting = false;
 
 set<PeerId> userIds;
-
-constexpr chrono::seconds HANDSHAKE_RETRY_AFTER = chrono::seconds(5);
 
 string promptTarget;
 
@@ -95,7 +91,7 @@ bool sendOffer(int sock, const Identity& me, const PeerId& peer, Session& s)
         return false;
     }
 
-    vector<unsigned char> handshakePayload(static_cast<unsigned char>(HandshakeType::OFFER));   // [Type]
+    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::OFFER)};   // [Type]
     handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [Type][Key]
     handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [Type][key][sig]
 
@@ -166,32 +162,6 @@ bool resendOffer(int sock, const Identity& me, const PeerId& peer, const Session
     return sendFrame(sock, MsgType::HANDSHAKE, body);
 }
 
-bool startHandshake(int sock, const Identity& me, const PeerId& peer, Session& s)
-{
-    wipeSession(s);
-    s.isInitiator = amInitiator(me, peer);
-    makeKeyPair(s);
-
-    s.handshakeTime = chrono::steady_clock::now();
-
-    unsigned char sig[crypto_sign_BYTES];
-    if (!signHandshake(me, peer.data(), s.pk, sig))
-    {
-        return false;
-    }
-    vector<unsigned char> handshakePayload(s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);  // [eph pk]
-    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);  // [eph pk][sig]
-
-    vector<unsigned char> body = buildBody(peer, handshakePayload);
-
-    if(!sendFrame(sock, MsgType::HANDSHAKE, body))
-    {
-        return false;
-    }
-
-    return true;
-}
-
 
 void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts)
 {
@@ -230,7 +200,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
 
                     // find taht sender's session
                     auto it = sessions.find(sender);
-                    if (it == sessions.end() || !it->second.ready)
+                    if (it == sessions.end() || it->second.state != SessionState::READY)
                     {
                         cerr << "Message from unknown or unsecured peer rejected." << endl;
                         redrawPrompt();
@@ -280,21 +250,62 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     }
 
                     // check payload size
-                    if (payload.size() != HANDSHAKE_PAYLOAD_SIZE)
+                    if (payload.empty())
                     {
                         cerr << "Malformed payload received." << endl;
                         redrawPrompt();
                         continue;
                     }
 
-                    // split
-                    const unsigned char* ephPk = payload.data();
-                    const unsigned char* sig = payload.data() + crypto_kx_PUBLICKEYBYTES;
+                    const unsigned char kind = payload[0];
 
-                    // verify
-                    if (!verifyHandshake(sender.data(), id.pk, ephPk, sig))
+                    const unsigned char* peerKey = nullptr;
+                    const unsigned char* answeredKey = nullptr;
+                    bool isOffer = false;
+
+                    if (kind == static_cast<unsigned char>(HandshakeType::OFFER))
                     {
-                        cerr << "Handshake signature invalid. Rejected." << endl;
+                        if (payload.size() != OFFER_PAYLOAD_SIZE)
+                        {
+                            cerr << "Malformed Offer payload received." << endl;
+                            redrawPrompt();
+                            continue;
+                        }
+
+                        peerKey = payload.data() + 1;
+                        const unsigned char* sig = payload.data() + 1 + crypto_kx_PUBLICKEYBYTES;
+
+                        if (!verifyOffer(sender.data(), id.pk, peerKey, sig))
+                        {
+                            cerr << "Offer signature invalid. Rejected." << endl;
+                            redrawPrompt();
+                            continue;
+                        }
+                        isOffer = true;
+                    }
+                    else if (kind == static_cast<unsigned char>(HandshakeType::REPLY))
+                    {
+                        if (payload.size() != REPLY_PAYLOAD_SIZE)
+                        {
+                            cerr << "Malformed Reply payload received." << endl;
+                            redrawPrompt();
+                            continue;
+                        }
+
+                        peerKey = payload.data() + 1;
+                        answeredKey = payload.data() + 1 + crypto_kx_PUBLICKEYBYTES;
+                        const unsigned char* sig = payload.data() + 1 + crypto_kx_PUBLICKEYBYTES*2;
+
+                        if (!verifyReply(sender.data(), id.pk, peerKey, answeredKey, sig))
+                        {
+                            cerr << "Reply signature invalid. Rejected." << endl;
+                            redrawPrompt();
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        cerr << "Unknown handshake type. Rejected." << endl;
                         redrawPrompt();
                         continue;
                     }
@@ -310,34 +321,55 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                         continue;
                     }
 
-                    // look up sender. if no sesiion or no key pair, the peer started handshake, create session  with sender. then call start handshake
-                    auto it = sessions.find(sender);
-                    bool needReply = (it == sessions.end() || !it->second.hasKeyPair || it->second.ready);
-
                     Session& s = sessions[sender];
 
-                    if (needReply)
+                    if (isOffer)
                     {
-                        if (!startHandshake(clientSocket, id, sender, s))
+                        if (s.state == SessionState::READY && memcmp(s.peerPk, peerKey, crypto_kx_PUBLICKEYBYTES) == 0)
+                        {  
+                            redrawPrompt();
+                            continue;
+                        }
+
+                        if (s.state == SessionState::OFFERED && memcmp(s.peerPk, peerKey, crypto_kx_PUBLICKEYBYTES) < 0)
                         {
-                            cerr << "Failed to send HANDSHAKE reply." << endl;
+                            if (!resendOffer(clientSocket, id, sender, s))
+                            {
+                                cerr << "Failed to resend offer." << endl;
+                                wipeSession(s);
+                                sessions.erase(sender);
+                            }  
+                            redrawPrompt();
+                            continue;
+                        }
+
+                        if (!sendReply(clientSocket,id, sender, s, peerKey))
+                        {
+                            cerr << "Failed to reply to handshake." << endl;
+                            wipeSession(s);
                             sessions.erase(sender);
                             redrawPrompt();
                             continue;
                         }
                     }
-
-                    if (!deriveSessionKeys(s, string(ephPk, ephPk + crypto_kx_PUBLICKEYBYTES)))
+                    else
                     {
-                        cout << "\r\033[K";
-                        cerr << "Failed to derive session keys." << endl;
-                        cerr << "HANDSHAKE rejected." << endl;
-                        wipeSession(s);
-                        sessions.erase(sender);
-                        redrawPrompt();
-                        continue;
+                        if (s.state != SessionState::OFFERED || memcmp(answeredKey, s.pk, crypto_kx_PUBLICKEYBYTES) != 0)
+                        {
+                            redrawPrompt();
+                            continue;
+                        }
+
+                        if (!deriveSessionKeys(s, string(peerKey, peerKey + crypto_kx_PUBLICKEYBYTES)))
+                        {
+                            cerr << "Failed to derive session keys. Handshake rejected." << endl;
+                            wipeSession(s);
+                            sessions.erase(sender);
+                            redrawPrompt();
+                            continue;
+                        }
+                        s.state = SessionState::READY;
                     }
-                    s.ready = true;
 
                     cout << "Verified secure connection with " << displayName(contacts, sender) << endl;
 
@@ -657,38 +689,22 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                             promptTarget = peerName;
                             auto it = sessions.find(selected);
 
-                            if (it == sessions.end() || !it->second.hasKeyPair)
-                            {
-                                cout << "Establishing secure connection..." << endl;
-                                if (!startHandshake(clientSocket, id, selected, sessions[selected]))
-                                {
-                                    sessions.erase(selected);
-                                    cerr << "Failed to send handshake to " << peerName << "." << endl;
-                                }
-                            }
-                            else if (it->second.ready)
+                            if (it != sessions.end() && it->second.state == SessionState::READY)
                             {
                                 cout << "Already connected to " << peerName << "." << endl;
                             }
                             else
                             {
-                                // retryu handshake
-                                auto waited = chrono::steady_clock::now() - it->second.handshakeTime;
+                                // NONE (or no session yet): start a handshake.
+                                // OFFERED: send a fresh offer; safe at any time, a reply to the old one is ignored as stale.
+                                const bool retrying = (it != sessions.end() && it->second.state == SessionState::OFFERED);
+                                cout << (retrying ? "No reply yet, sending a new offer..." : "Establishing secure connection...") << endl;
 
-                                if (waited >= HANDSHAKE_RETRY_AFTER)
+                                if (!sendOffer(clientSocket, id, selected, sessions[selected]))
                                 {
-                                    cout << "No reply from " << peerName << " yet, retrying..." << endl;
-                                    if (!startHandshake(clientSocket, id, selected, it->second))
-                                    {
-                                        sessions.erase(it);
-                                        cerr << "Failed to send handshake to " << peerName << "." << endl;
-                                    }
+                                    sessions.erase(selected);
+                                    cerr << "Failed to send handshake to " << peerName << "." << endl;
                                 }
-                                else
-                                {
-                                    cout << "Still waiting for " << peerName << ". If it doesn't connect, make sure " << peerName << " has added you, then try /chat " << peerName << " again in a few seconds." << endl;
-                                }
-
                             }
                         }
                     }
@@ -713,7 +729,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                 }
 
                 auto it = sessions.find(*currentPeer);
-                if (it == sessions.end() || !it->second.ready)
+                if (it == sessions.end() || it->second.state != SessionState::READY)
                 {
                     cout << "\r\033[K";
                     cerr << "Connection not secured yet. Wait for the fingerprint." << endl;
