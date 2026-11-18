@@ -14,14 +14,16 @@ The server authenticates users and routes frames, but it never holds conversatio
 - **Contacts:** After comparing fingerprints with someone out of band, you save their ID under a name with `/add`. Contacts are stored per profile and shown by name everywhere: in `/users`, in connection messages and on every incoming message.
 - **Contacts-only conversations:** `/chat` only accepts saved contacts, and handshakes from anyone else are ignored, with a one-time notice per person. Both people must add each other before they can talk, which makes the fingerprint check a required step.
 - **Trustworthy sender labels:** Incoming messages are labeled with the name *you* saved for the sender's ID, not a name the sender chose.
-- **Live presence:** The server sends the list of online users at login, then notifies clients as users come online or go offline.
+- **Live presence:** The server sends the list of online users at login (split over several frames when it is long), then notifies clients as users come online or go offline, always in order.
 - **Signed offer/reply handshakes:** A conversation starts with a signed *offer* and is answered with a signed *reply* that names the offer it answers, so neither side ever has to guess what a handshake means. Both are bound to both users' IDs, and the receiver verifies the signature before touching any session, so forged, altered, redirected or stale handshakes are rejected and cannot disturb an existing conversation.
 - **Reliable connection setup:** If both people start a chat at the same moment, the two offers are resolved the same way on both sides. If a handshake gets no reply (for example because the peer had not added you yet), running `/chat` again sends a fresh offer straight away.
 - **End-to-end encryption:** XChaCha20-Poly1305 authenticated encryption with a fresh random 24-byte nonce for every message.
 - **Ephemeral key exchange per conversation:** A new key pair for every session, with directional `rx`/`tx` keys derived using libsodium's `crypto_kx` API. Ephemeral secret keys are wiped as soon as session keys are derived, and session keys are wiped when the peer goes offline or is removed from your contacts.
 - **Session fingerprints:** After each handshake, both clients print a hash of the two ephemeral public keys, which can be compared as an extra check.
 - **Addressed, relay-only routing:** The server forwards only `HANDSHAKE` and `MESSAGE` frames, and only to the addressed recipient. It stamps every relayed frame with the authenticated sender's ID, so clients cannot impersonate each other. A client that sends any other frame type is disconnected.
+- **Robust multithreaded server:** One thread per client, with a send lock per connection so frames never interleave, connections shared through `shared_ptr` and closed only when no thread can still use them, no network sends while the user registry is locked, send and login timeouts, and a connection cap. A client that stops reading is dropped instead of stalling everyone else.
 - **Input validation:** Frame lengths, message types, IDs, public-key sizes, signatures, ciphertext sizes, profile and contact names, command arguments and contacts-file lines are checked before use. Malformed or unauthenticated data is rejected without crashing.
+- **Load generator:** `loadgen` drives the server with hundreds of headless clients doing real logins, handshakes and encrypted messages, and reports correctness (lost, reordered and misdelivered messages), throughput, latency percentiles and fairness. Modes for paced load, many-to-one traffic, constant reconnects and clients that stop reading reproduced several concurrency bugs, which are now fixed. Results are in [`docs/benchmarks.md`](docs/benchmarks.md).
 - **Tests and CI:** [doctest](https://github.com/doctest/doctest) unit tests for framing, cryptography, contacts and input parsing, plus integration tests that start the real server and talk to it over TCP. All tests run with AddressSanitizer and UndefinedBehaviorSanitizer, on Ubuntu and macOS, on every push through GitHub Actions.
 - **Terminal chat interface:** Colored messages, live line editing, a prompt that shows who you are talking to (`you -> bob >`) and is redrawn when messages arrive, and terminal settings restored on every exit path.
 - **Configurable host, port and profile:** Set from the command line, defaulting to `127.0.0.1:8080` and the `default` profile.
@@ -32,10 +34,10 @@ The server authenticates users and routes frames, but it never holds conversatio
 | --- | --- |
 | Language | C++20 |
 | Transport | POSIX TCP sockets |
-| Concurrency | `std::thread`, `std::mutex`, `std::atomic` |
+| Concurrency | `std::thread`, `std::mutex`, `std::atomic`, `std::shared_ptr`, `std::latch` |
 | Cryptography | libsodium (Ed25519 `crypto_sign`, X25519 `crypto_kx`, XChaCha20-Poly1305, BLAKE2b via `crypto_generichash`) |
 | Terminal | `termios`, ANSI escape sequences |
-| Testing | doctest, AddressSanitizer, UndefinedBehaviorSanitizer |
+| Testing | doctest, AddressSanitizer, UndefinedBehaviorSanitizer, custom load generator |
 | CI | GitHub Actions (Ubuntu with `g++`, macOS with `clang`) |
 | Build | GNU Make, `g++` |
 
@@ -68,7 +70,7 @@ cd tcp-chat
 make
 ```
 
-This produces two executables: `server` and `client`. Both link against libsodium: the client for all of its cryptography, and the server only to verify login signatures.
+This produces two executables: `server` and `client`. Both link against libsodium: the client for all of its cryptography, and the server only to verify login signatures. The load generator is built separately with `make loadgen` (see [Load Testing](#load-testing)).
 
 If the compiler or linker cannot find a Homebrew-installed libsodium on macOS:
 
@@ -92,7 +94,7 @@ make test
 This builds the server, then builds `run_tests` from every `tests/test_*.cpp` file with AddressSanitizer and UndefinedBehaviorSanitizer enabled, and runs it:
 
 - **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, the contacts file, and name and command parsing.
-- **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejected logins, offline recipients, and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
+- **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejected logins, offline recipients, a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
 
 The sanitizers fail the run at the first out-of-bounds memory access or undefined behavior, even if every check would otherwise pass.
 
@@ -158,6 +160,39 @@ If someone who has not added you tries to talk to you, you see a notice with the
 - When the server runs inside **WSL**, other machines can't reach it by default. Enable WSL's mirrored networking mode, or run the server on another machine.
 - On **macOS**, only `127.0.0.1` is a working loopback address by default. Other `127.x.x.x` addresses that work on Linux will fail there.
 
+## Load Testing
+
+`loadgen` connects many headless bot clients to a running server. The bots log in, run the signed offer/reply handshake and send real encrypted messages, just like `client`. Each message carries its send time and a sequence number, so every delivery is timed and checked.
+
+```bash
+make server loadgen
+./server 9000 > /tmp/server.log 2>&1 &
+./loadgen --pairs 10 --messages 10000
+```
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `--host H`, `--port N` | Server to test | `127.0.0.1`, `9000` |
+| `--pairs N` | Number of receivers | `10` |
+| `--fanin K` | Senders per receiver (several server threads writing to one socket) | `1` |
+| `--messages N` | Messages per sender | `10000` |
+| `--size N` | Bytes per message (at least 16) | `64` |
+| `--rate N` | Messages per second per sender; `0` sends as fast as possible | `0` |
+| `--churn C` | Extra pairs whose receiver keeps disconnecting and logging back in | `0` |
+| `--stalled S` | Extra receivers that never read, while their senders flood them | `0` |
+
+The report gives, in order:
+
+- **What was run:** date, machine, CPU count, load and rate.
+- **Delivery:** delivered, missing, lost, out-of-order and misdelivered messages, churn and stalled-client results, and a single **`OK` / `FAILED` verdict**. If it says `FAILED`, ignore the performance numbers.
+- **Performance**, after a 10% warm-up: throughput and latency percentiles (p50 to max). Without `--rate`, senders never wait, so latency mostly measures queueing; use `--rate` for meaningful latency. Paced runs also report whether the senders kept to the schedule.
+- **Fairness:** the slowest, median and fastest sender.
+- A one-line **`summary`** for collecting many runs with `grep '^summary'`.
+
+The exit code is `0` only if the verdict is `OK`. Measured results, and the bugs the tool found, are recorded in [`docs/benchmarks.md`](docs/benchmarks.md).
+
+> On WSL, keep the server's output out of `/mnt/c`, for example in `/tmp`; writes to the Windows drive are slow enough to distort the measurements.
+
 ## How It Works
 
 ```text
@@ -186,8 +221,9 @@ Client A                    Relay Server                    Client B
 
 1. When a client connects, the server sends a `CHALLENGE` of 32 random bytes.
 2. The client signs `"tcpchat-login-v1" || challenge` with its Ed25519 identity key and replies with `AUTH`: its 32-byte public key followed by the 64-byte signature. The label keeps a login signature from being reusable in any other context.
-3. The server verifies the signature. If it is valid and that identity is not already online, the server sends `AUTH_OK`, registers the client, sends it a `USER_LIST`, and sends `USER_ONLINE` to everyone else. Otherwise it sends `ERROR_MSG` and closes the connection.
-4. When a client disconnects, the server removes it and sends `USER_OFFLINE` to everyone else.
+3. The server verifies the signature. If it is valid and that identity is not already online, the server sends `AUTH_OK`, registers the client, sends it the list of online users, and sends `USER_ONLINE` to everyone else. Otherwise it sends `ERROR_MSG` and closes the connection. A long user list is split over several `USER_LIST` frames, each saying whether more follow.
+4. The login must be completed within **10 seconds** of connecting, or the server closes the connection. The server accepts at most **1,000** connections at once; beyond that, a new connection gets `ERROR_MSG` "Server full." and is closed.
+5. When a client disconnects, the server removes it and sends `USER_OFFLINE` to everyone else. The same identity can log in again once that has been sent, so other users never see "online" before the previous "offline".
 
 ### Contacts
 
@@ -233,6 +269,18 @@ The file is rewritten in full on every `/add` and `/remove`. The client writes `
 9. Messages (`name : message`) are encrypted with that peer's `tx` and a new random nonce, sent addressed to the peer, and decrypted by the recipient with its `rx` for the sender. The recipient displays the name it saved for the sender's ID and ignores the name inside the message. Messages from peers without a Ready session, or that fail authentication, are rejected.
 10. When a peer goes offline, or is removed from your contacts, the client wipes and removes that peer's session.
 
+### Server Design
+
+The server runs one thread per client. Several threads may need to send to the same client at once (its own handler, everyone messaging it, and presence updates), so each connection is wrapped in a `Connection`:
+
+- **One send lock per connection:** every frame to a client is written while holding that client's lock, so frames never interleave. Threads sending to different clients don't wait for each other.
+- **Shared ownership:** connections are held through `shared_ptr`. A thread that is sending to a client keeps its `Connection` alive even if the client disconnects meanwhile.
+- **Closed only by the last owner:** the socket is closed in `~Connection()`, when the last `shared_ptr` is released. Closing it earlier would free the socket number for reuse by a new connection while another thread could still write to it. A connection is ended early with `shutdown()`, which cuts it but keeps the number reserved.
+- **No sends under the registry lock:** `clientsMutex` protects the map of logged-in users. Under it, the server only reads or changes the map and copies what it needs (the user list, who to notify); all sends happen after it is released, so one slow client can't block logins, logouts or message routing for everyone else.
+- **Ordered login frames:** a new client holds its own send lock from just before it is added to the map until `AUTH_OK` and the user list are sent, so those are always the first frames it receives.
+- **Timeouts and limits:** a send that blocks for 2 seconds fails, and that client is dropped (a partly written frame would leave its stream unreadable anyway); logins time out after 10 seconds; at most 1,000 connections are accepted.
+- **No small-write delays:** `TCP_NODELAY` is set on every socket, on the server and the clients. Without it, Nagle's algorithm and delayed ACKs held back one message per conversation by about 40 ms.
+
 ### TCP Frame Format
 
 Each frame is encoded as:
@@ -254,11 +302,11 @@ Relayed frames carry an **addressed body**: `[32-byte peer ID][payload]`. From c
 | `MESSAGE` | 1 | client (relayed) | `[peer ID][24-byte nonce][ciphertext][16-byte tag]` |
 | `HANDSHAKE` | 2 | client (relayed) | `[peer ID][payload]`; see below |
 | — | 3, 4 | — | Reserved (formerly `PEER_JOINED`/`PEER_LEFT`, no longer used) |
-| `ERROR_MSG` | 5 | server only | Error text, or the 32-byte ID of a recipient who is not online |
+| `ERROR_MSG` | 5 | server only | Error text (e.g. "Server full."), or the 32-byte ID of a recipient who is not online |
 | `CHALLENGE` | 6 | server only | 32 random bytes |
 | `AUTH` | 7 | client only | `[32-byte Ed25519 public key][64-byte signature]` |
 | `AUTH_OK` | 8 | server only | Empty |
-| `USER_LIST` | 9 | server only | Concatenated 32-byte IDs of the other online users |
+| `USER_LIST` | 9 | server only | `[1 byte: 1 if another USER_LIST follows, 0 if last][up to 255 IDs of 32 bytes]` |
 | `USER_ONLINE` | 10 | server only | 32-byte ID |
 | `USER_OFFLINE` | 11 | server only | 32-byte ID |
 
@@ -270,6 +318,8 @@ A `HANDSHAKE` payload starts with a kind byte:
 | Offer | 2 | `[kind][32-byte offer key][64-byte signature]` | 97 bytes |
 
 The kind byte itself is not signed, but it decides which label the signature is checked with, so changing it makes verification fail.
+
+A frame can't exceed 8,192 bytes, so the list of online users is sent as one or more `USER_LIST` frames of up to 255 IDs, (8,192 − 1 type byte − 1 flag byte) / 32. The client adds each frame's IDs to its list; at least one frame is always sent, even for an empty list.
 
 The `readNBytes()` and `sendAll()` helpers handle reads and writes that transfer fewer bytes than requested, since TCP does not preserve message boundaries. `sendFrame()`, `receiveFrame()`, `buildBody()` and `parseBody()` build and parse frames, and are shared by the client and server so both always use the same format.
 
@@ -292,26 +342,32 @@ tcp-chat/
 │       └── ci.yml          # Build and test on Ubuntu and macOS on every push
 ├── src/
 │   ├── client.cpp          # Profiles, login, commands, per-peer sessions, terminal UI, send/receive threads
-│   ├── server.cpp          # Login verification, user registry, presence updates, addressed routing
+│   ├── server.cpp          # Login verification, connections, user registry, presence, routing, limits
 │   ├── crypto.cpp          # Identity keys, login, offer and reply signing, session keys, fingerprints, AEAD helpers
 │   ├── crypto.hpp          # Identity, Session and session states, payload sizes, cryptography declarations
 │   ├── contacts.cpp        # Contact rules, hex IDs, loading and safely saving the contacts file
 │   ├── contacts.hpp
-│   ├── net.cpp             # Framing, addressed bodies, user lists, complete socket read/write helpers
+│   ├── botclient.cpp       # Headless client used by the integration tests and the load generator
+│   ├── botclient.hpp
+│   ├── net.cpp             # Framing, addressed bodies, split user lists, socket helpers, TCP_NODELAY
 │   ├── net.hpp             # Message and handshake types, peer IDs, labels, limits, networking declarations
 │   ├── util.cpp            # Name validation and command parsing
 │   └── util.hpp
 ├── tests/
 │   ├── doctest.h           # Test framework (single header)
 │   ├── test_main.cpp       # Initializes libsodium and runs all tests
-│   ├── test_net.cpp        # Framing and user-list parsing
+│   ├── test_net.cpp        # Framing, user-list splitting and parsing
 │   ├── test_crypto.cpp     # Offer and reply signing, key derivation, encryption
 │   ├── test_contacts.cpp   # Hex IDs, contact rules, saving and loading the contacts file
 │   ├── test_util.cpp       # Name validation and command parsing
-│   └── test_integration.cpp  # Real server over TCP: login, offers and replies, routing, malformed frames
+│   └── test_integration.cpp  # Real server over TCP: login, offers and replies, routing, long user lists, malformed frames
+├── tools/
+│   └── loadgen.cpp         # Load generator: correctness, throughput, latency and fairness under load
+├── docs/
+│   └── benchmarks.md       # Load test results, bugs found and before/after numbers
 ├── experiments/
 │   └── terminal_test.cpp   # Early terminal input experiments (not built)
-├── Makefile                # Build, test and clean targets
+├── Makefile                # Build, test, loadgen and clean targets
 ├── .gitignore
 ├── LICENSE                 # MIT license
 └── README.md
@@ -326,6 +382,7 @@ This is an experimental application, **not an audited or production-ready secure
 - **Local files are protected only by permissions:** Each `identity.key` and `contacts` file is protected only by file and folder permissions (`0600` and `0700`). Anyone who can write to your profile folder could swap a contact's ID or steal your identity.
 - **No replay protection for messages:** A captured valid message could be re-sent, and messages could be dropped or reordered, without detection.
 - **Message type not bound to ciphertext:** The frame type is not yet included as authenticated additional data.
+- **Limited protection against denial of service:** The login timeout and the 1,000-connection cap stop the simplest resource exhaustion, but there are no per-address limits or rate limits, so a determined client can still fill the server or flood other users.
 - **Metadata is visible to the server:** It sees who is online, who talks to whom, and message sizes and timing, though not message content.
 - **No offline delivery or history:** Messages to users who are not online are not stored, and no chat history is kept.
 
@@ -351,6 +408,9 @@ Do not rely on this project to protect sensitive information.
 - [x] Show the current conversation in the prompt
 - [x] Show each unknown-sender notice only once per person
 - [x] Mark handshakes as offers or replies, with each reply bound to the offer it answers
+- [x] Load generator with paced, fan-in, churn and stalled-client modes, and recorded benchmarks
+- [x] Fix server concurrency bugs found under load: interleaved frames, reused sockets, sends under the registry lock, Nagle delays, per-message logging
+- [x] Login timeout, connection cap, and user lists longer than one frame
 - [ ] Freshness check for offers, so a replayed old offer is rejected
 - [ ] Split the client into a core and a front end, with unit tests for the handshake rules
 - [ ] Dedicated "user not found" frame type instead of `ERROR_MSG`
@@ -359,7 +419,8 @@ Do not rely on this project to protect sensitive information.
 - [ ] Full-screen terminal UI
 - [ ] `make install`, standard config and data paths, releases and a Homebrew tap
 - [ ] Group chat
-- [ ] Replace thread-per-client with `poll()`, and add load and latency benchmarks
+- [ ] Per-connection outgoing queues or a `poll()`-based server, so one slow client never delays a broadcast
+- [ ] Run the load generator in CI
 
 ## License
 
