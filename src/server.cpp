@@ -29,6 +29,14 @@ struct Connection
     mutex sendMutex;
 
     explicit Connection(int s) : sock(s) {}
+    ~Connection() { close(sock); }
+
+    // one connection per socket
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+
+    // ends connection NOW
+    void shutdown() { ::shutdown(sock, SHUT_RDWR); }
 
     bool send(MsgType type, const vector<unsigned char>& body)
     {
@@ -42,11 +50,10 @@ using ClientMap = map<PeerId, shared_ptr<Connection>>;   // logged-in user ID ->
 mutex clientsMutex;
 mutex coutMutex;
 
-void rejectClient(int clientSocket, const string& reason)
+void rejectClient(Connection& conn, const string& reason)
 {
     vector<unsigned char> msg(reason.begin(), reason.end());
-    sendFrame(clientSocket, MsgType::ERROR_MSG, msg);
-    close(clientSocket);
+    conn.send(MsgType::ERROR_MSG, msg);
 }
 
 bool sendUserList(Connection& conn, const PeerId& selfId, const ClientMap& inputMap)
@@ -76,8 +83,7 @@ void clientHandler(int clientSocket, ClientMap& clients)
     {
         lock_guard<mutex> lock(coutMutex);
         cerr << "Failed to send challenge to client" << endl;
-        close(clientSocket);
-        return;
+        return;   // conn destroyed here; closes the socket
     }
 
     // receive auth and verify against login_label + challenge
@@ -93,7 +99,7 @@ void clientHandler(int clientSocket, ClientMap& clients)
             cerr << "Client disconnected or Error receiving frame." << endl;
         }
         // reject client 
-        rejectClient(clientSocket, "Error receiving Auth.");
+        rejectClient(*conn, "Error receiving Auth.");
         return;
     }
 
@@ -109,7 +115,7 @@ void clientHandler(int clientSocket, ClientMap& clients)
     // verify
     if (crypto_sign_verify_detached(signature, message.data(), message.size(), clientId.data()) != 0)
     {
-        rejectClient(clientSocket, "Error on verifying signature.");
+        rejectClient(*conn, "Error on verifying signature.");
         return;
     }
 
@@ -118,13 +124,12 @@ void clientHandler(int clientSocket, ClientMap& clients)
 
         if (clients.count(clientId) > 0)
         {
-            rejectClient(clientSocket, "Already logged in.");
+            rejectClient(*conn, "Already logged in.");
             return;
         }
 
         if (!conn->send(MsgType::AUTH_OK, {}))
         {
-            close(clientSocket);
             return;
         }
 
@@ -133,7 +138,6 @@ void clientHandler(int clientSocket, ClientMap& clients)
         if (!sendUserList(*conn, clientId, clients))
         {   
             clients.erase(clientId);
-            close(clientSocket);
             return;
         }
 
@@ -227,7 +231,8 @@ void clientHandler(int clientSocket, ClientMap& clients)
 	    }
 	}
 
-	close(clientSocket);
+    // cut connection now so client sees it closed even if another thread still holds shared_ptr to it
+    conn->shutdown();
     {
         lock_guard<mutex> lock(coutMutex);
         cout << "Client disconnected" << endl;
@@ -311,7 +316,7 @@ int main(int argc, char* argv[])
             perror("Accept");
             continue;
         }
-
+        
         if (!setNoDelay(clientSocket))
         {
             perror("setsockopt(TCP_NODELAY)");
