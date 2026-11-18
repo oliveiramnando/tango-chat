@@ -1,7 +1,9 @@
-// Load generator, step 5: a report you can trust and paste.
+// Load generator: drives the chat server with many headless bot clients and reports
+// correctness, throughput, latency and fairness.
 //
 // P pairs of bots (alice_i -> bob_i). For each pair:
-//   - a sender thread sends M probes from alice_i as fast as it can (no waiting for delivery)
+//   - a sender thread sends M probes from alice_i, either as fast as it can or at a fixed
+//     rate (--rate), never waiting for delivery
 //   - a receiver thread reads them on bob_i and records when each one was sent and arrived
 // Every thread writes only to its own pair's data; the main thread merges after join().
 //
@@ -14,7 +16,8 @@
 //   - fairness:                    how differently the pairs were treated
 // and ends with one key=value line, easy to collect from many runs with grep.
 //
-// Usage: ./loadgen <host> <port> [pairs] [messages per pair] [size]
+// Usage: ./loadgen [--host H] [--port N] [--pairs N] [--messages N] [--size N] [--rate N]
+//        ./loadgen --help
 
 #include <sodium.h>
 #include <unistd.h>
@@ -56,10 +59,11 @@ uint64_t nowNs()
 }
 
 // Builds [send time][seq][padding]. `size` is the total plaintext length (at least 16).
-string makeProbe(uint64_t seq, size_t size)
+// `sentNs` is the time the message counts as sent from (see runSender for why that
+// isn't always "now").
+string makeProbe(uint64_t seq, uint64_t sentNs, size_t size)
 {
     string probe(size, 'x');               // padding first; the header overwrites the start
-    uint64_t sentNs = nowNs();              // stamped as late as possible, right before sending
     memcpy(probe.data(), &sentNs, 8);
     memcpy(probe.data() + 8, &seq, 8);
     return probe;
@@ -81,14 +85,19 @@ bool readProbe(const string& probe, uint64_t& seq, uint64_t& sentNs)
 
 struct Config
 {
-    string host;
-    int port = 0;
+    string host = "127.0.0.1";
+    int port = 9000;
     int pairs = 10;
     int messages = 10000;   // per pair
     size_t size = 64;       // plaintext bytes per message
+    double rate = 0;        // messages per second per pair; 0 = as fast as possible
 
     int warmupMessages() const { return static_cast<int>(messages * WARMUP_FRACTION); }
+    bool paced() const { return rate > 0; }
 };
+
+// A sender counts as "behind" when a message goes out more than this long after its slot.
+constexpr uint64_t LATE_NS = 1'000'000;   // 1 ms
 
 // ---------- one pair ----------
 
@@ -115,6 +124,8 @@ struct Pair
     int sent = 0;
     int sendErrors = 0;
     string sendError;          // first failure reason, for the report
+    int late = 0;              // paced runs: messages sent more than LATE_NS after their slot
+    uint64_t maxLagNs = 0;     // paced runs: the furthest behind schedule the sender got
 
     // written by the receiver thread
     vector<Sample> samples;    // one per delivered message, in arrival order
@@ -124,12 +135,50 @@ struct Pair
     string receiveError;       // first failure reason, for the report
 };
 
+// Unpaced: send as fast as possible; each message counts as sent when it is built.
+//
+// Paced (--rate R): message i has a fixed slot at start + i/R. The sender sleeps until the
+// slot, then sends. If it is already late (the server or this machine fell behind), it sends
+// straight away to catch up, without sleeping.
+//
+// In a paced run each message counts as sent at its SLOT, not when it actually went out.
+// Otherwise a stall hides itself: while the sender is stuck, it isn't sending, so no message
+// "experiences" the stall, and the latency numbers look fine. A real user who pressed enter
+// at that slot would have waited the whole time. Measuring from the slot charges the delay to
+// every message that should have been sent during it. (This mistake is known as
+// "coordinated omission".)
 void runSender(Pair& p, const Config& cfg, latch& go)
 {
     go.wait();   // every thread starts at the same moment
+    const uint64_t startNs = nowNs();
+    const double slotNs = cfg.paced() ? 1e9 / cfg.rate : 0;
+
     for (int i = 0; i < cfg.messages; ++i)
     {
-        if (!bot::sendMessage(p.alice, p.bob.pid, p.aliceSession, makeProbe(i, cfg.size)))
+        uint64_t sentNs = 0;
+        if (cfg.paced())
+        {
+            const uint64_t slot = startNs + static_cast<uint64_t>(i * slotNs);
+            uint64_t now = nowNs();
+            if (now < slot)
+            {
+                this_thread::sleep_for(chrono::nanoseconds(slot - now));
+                now = nowNs();
+            }
+            const uint64_t lag = now > slot ? now - slot : 0;
+            p.maxLagNs = max(p.maxLagNs, lag);
+            if (lag > LATE_NS)
+            {
+                ++p.late;
+            }
+            sentNs = slot;
+        }
+        else
+        {
+            sentNs = nowNs();   // stamped as late as possible, right before sending
+        }
+
+        if (!bot::sendMessage(p.alice, p.bob.pid, p.aliceSession, makeProbe(i, sentNs, cfg.size)))
         {
             ++p.sendErrors;
             p.sendError = bot::lastError();
@@ -312,6 +361,10 @@ struct Summary
     vector<string> reasons;          // a few example failure reasons
     double totalSeconds = 0;         // release of the threads -> last message delivered
 
+    // paced runs: did the senders actually keep to the schedule?
+    int late = 0;                    // messages sent more than LATE_NS after their slot
+    uint64_t maxLagNs = 0;
+
     // performance, over messages after warm-up only
     size_t measured = 0;             // how many messages that is
     double windowSeconds = 0;        // first to last measured arrival
@@ -346,6 +399,8 @@ Summary summarize(const vector<unique_ptr<Pair>>& pairs, const Config& cfg, uint
         s.receiveErrors += p->receiveErrors;
         s.lost += p->lost;
         s.outOfOrder += p->outOfOrder;
+        s.late += p->late;
+        s.maxLagNs = max(s.maxLagNs, p->maxLagNs);
         for (const string& why : {p->sendError, p->receiveError})
         {
             if (!why.empty() && s.reasons.size() < 5)
@@ -427,6 +482,15 @@ void printReport(const Summary& s, const Config& cfg)
            hostName().c_str(), thread::hardware_concurrency(), cfg.host.c_str(), cfg.port);
     printf("load        %d pairs (%d bots), %d messages each, %zu bytes, first %d per pair = warm-up\n",
            cfg.pairs, cfg.pairs * 2, cfg.messages, cfg.size, cfg.warmupMessages());
+    if (cfg.paced())
+    {
+        printf("rate        %.0f msg/s per pair = %.0f msg/s offered in total\n",
+               cfg.rate, cfg.rate * cfg.pairs);
+    }
+    else
+    {
+        printf("rate        unlimited (senders never wait: latency = time spent queued)\n");
+    }
 
     // Correctness first: performance numbers mean nothing if messages went missing.
     printf("delivery    %d / %d delivered   errors: %d send, %d receive   "
@@ -436,6 +500,16 @@ void printReport(const Summary& s, const Config& cfg)
     for (const string& why : s.reasons)
     {
         printf("              e.g. %s\n", why.c_str());
+    }
+
+    // A paced run only means something if the load was actually applied. If the senders fell
+    // behind, the server (or this machine) couldn't keep up with the offered rate.
+    if (cfg.paced())
+    {
+        const double latePct = s.sent > 0 ? 100.0 * s.late / s.sent : 0;
+        printf("schedule    %d sent >1 ms late (%.1f%%), worst lag %.1f ms   -> %s\n",
+               s.late, latePct, s.maxLagNs / 1e6,
+               latePct < 1.0 ? "kept up" : "FELL BEHIND (couldn't keep to the schedule)");
     }
 
     printf("time        %.3f s total, %.3f s measured\n", s.totalSeconds, s.windowSeconds);
@@ -465,33 +539,90 @@ void printReport(const Summary& s, const Config& cfg)
     }
 
     // One line with everything, for scripts: ./loadgen ... | grep '^summary'
-    printf("summary pairs=%d messages=%d size=%zu ok=%d delivered=%d missing=%d lost=%d "
-           "ooo=%d errors=%d throughput=%.0f p50_us=%.1f p99_us=%.1f max_us=%.1f\n",
-           cfg.pairs, cfg.messages, cfg.size, s.clean() ? 1 : 0, s.delivered, s.missing,
-           s.lost, s.outOfOrder, s.sendErrors + s.receiveErrors, s.throughput,
+    printf("summary pairs=%d messages=%d size=%zu rate=%.0f ok=%d delivered=%d missing=%d lost=%d "
+           "ooo=%d errors=%d late=%d throughput=%.0f p50_us=%.1f p99_us=%.1f max_us=%.1f\n",
+           cfg.pairs, cfg.messages, cfg.size, cfg.rate, s.clean() ? 1 : 0, s.delivered, s.missing,
+           s.lost, s.outOfOrder, s.sendErrors + s.receiveErrors, s.late, s.throughput,
            us(percentile(s.latencies, 50)), us(percentile(s.latencies, 99)),
            s.latencies.empty() ? 0.0 : us(s.latencies.back()));
+}
+
+// ---------- options ----------
+
+void printUsage(const char* program)
+{
+    const Config d;   // the defaults
+    printf("usage: %s [options]\n"
+           "  --host H        server address          (default %s)\n"
+           "  --port N        server port             (default %d)\n"
+           "  --pairs N       sender/receiver pairs   (default %d)\n"
+           "  --messages N    messages per pair       (default %d)\n"
+           "  --size N        bytes per message, >= %zu (default %zu)\n"
+           "  --rate N        msg/s per pair, 0 = as fast as possible (default 0)\n"
+           "  --help          show this\n",
+           program, d.host.c_str(), d.port, d.pairs, d.messages, PROBE_HEADER, d.size);
+}
+
+// Fills `cfg` from --name value pairs. Returns false (after printing why) on a bad option.
+bool parseOptions(int argc, char* argv[], Config& cfg)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        const string name = argv[i];
+        if (name == "--help" || name == "-h")
+        {
+            printUsage(argv[0]);
+            exit(0);
+        }
+        if (i + 1 >= argc)
+        {
+            cerr << name << " needs a value (see --help)\n";
+            return false;
+        }
+        const string value = argv[++i];   // consume the value too
+
+        // stoi/stod throw on text that isn't a number; turn that into a clear message.
+        try
+        {
+            size_t used = 0;
+            if (name == "--host")          { cfg.host = value; used = value.size(); }
+            else if (name == "--port")     { cfg.port = stoi(value, &used); }
+            else if (name == "--pairs")    { cfg.pairs = stoi(value, &used); }
+            else if (name == "--messages") { cfg.messages = stoi(value, &used); }
+            else if (name == "--size")     { cfg.size = stoul(value, &used); }
+            else if (name == "--rate")     { cfg.rate = stod(value, &used); }
+            else
+            {
+                cerr << "unknown option " << name << " (see --help)\n";
+                return false;
+            }
+            if (used != value.size())   // e.g. "10x": stoi reads the 10 and stops
+            {
+                throw invalid_argument("trailing characters");
+            }
+        }
+        catch (const exception&)
+        {
+            cerr << "invalid value for " << name << ": " << value << "\n";
+            return false;
+        }
+    }
+
+    if (cfg.pairs < 1 || cfg.messages < 1 || cfg.size < PROBE_HEADER || cfg.rate < 0)
+    {
+        cerr << "need pairs >= 1, messages >= 1, size >= " << PROBE_HEADER << ", rate >= 0\n";
+        return false;
+    }
+    return true;
 }
 
 // ---------- main ----------
 
 int main(int argc, char* argv[])
 {
-    if (argc < 3)
-    {
-        cerr << "usage: " << argv[0] << " <host> <port> [pairs] [messages per pair] [size]\n";
-        return 1;
-    }
     Config cfg;
-    cfg.host = argv[1];
-    cfg.port = stoi(argv[2]);
-    if (argc > 3) cfg.pairs = stoi(argv[3]);
-    if (argc > 4) cfg.messages = stoi(argv[4]);
-    if (argc > 5) cfg.size = stoul(argv[5]);
-
-    if (cfg.pairs < 1 || cfg.messages < 1 || cfg.size < PROBE_HEADER)
+    if (!parseOptions(argc, argv, cfg))
     {
-        cerr << "need pairs >= 1, messages >= 1, size >= " << PROBE_HEADER << "\n";
         return 1;
     }
     if (sodium_init() < 0)
