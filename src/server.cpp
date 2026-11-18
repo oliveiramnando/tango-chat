@@ -163,13 +163,6 @@ void clientHandler(int clientSocket, ClientMap& clients)
         {
             break;
         }
-        // const vector<unsigned char> encryptedMessage(encrypted.begin(), encrypted.end()); 
-
-		// print bytes relayted
-        {
-            lock_guard<mutex> lock(coutMutex);
-            cout << "[Relayed " << encrypted.size() << " bytes]" << endl;
-        }
         
         vector<unsigned char> sendBody = buildBody(clientId, encrypted);
 
