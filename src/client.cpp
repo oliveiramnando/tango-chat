@@ -331,7 +331,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                             continue;
                         }
 
-                        if (s.state == SessionState::OFFERED && memcmp(s.peerPk, peerKey, crypto_kx_PUBLICKEYBYTES) < 0)
+                        if (s.state == SessionState::OFFERED && memcmp(s.pk, peerKey, crypto_kx_PUBLICKEYBYTES) < 0)
                         {
                             if (!resendOffer(clientSocket, id, sender, s))
                             {
