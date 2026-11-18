@@ -1,11 +1,12 @@
-// Integration tests: start the real ./server and talk to it over TCP,
-// using the same net/crypto functions as the client but without a terminal.
+// Integration tests: start the real ./server and talk to it over TCP
+// with headless bots (botclient.hpp), the same code the load generator uses.
 //
 // Run from the project root after building the server (make test does both).
 
 #include "doctest.h"
 #include "net.hpp"
 #include "crypto.hpp"
+#include "botclient.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -69,22 +70,7 @@ int freePort()
 // Connects to 127.0.0.1:port. Returns the socket, or -1 if nothing is listening.
 int connectTo(int port)
 {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
-    {
-        close(s);
-        return -1;
-    }
-
-    // Never block forever in the middle of a frame.
-    timeval timeout{2, 0};
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    return s;
+    return bot::connectTo("127.0.0.1", port);
 }
 
 // ---------- the server under test ----------
@@ -206,60 +192,17 @@ private:
     bool exited = false;
 };
 
-// ---------- a headless client ----------
+// ---------- a headless client (see botclient.hpp) ----------
 
-struct TestClient
-{
-    Identity id;
-    PeerId pid{};
-    int sock = -1;
-
-    TestClient()                       // brand-new identity
-    {
-        crypto_sign_keypair(id.pk, id.sk);
-        memcpy(pid.data(), id.pk, pid.size());
-    }
-
-    explicit TestClient(const Identity& existing) : id(existing)   // reuse an identity
-    {
-        memcpy(pid.data(), id.pk, pid.size());
-    }
-
-    ~TestClient() { disconnect(); }
-
-    void disconnect()
-    {
-        if (sock >= 0)
-        {
-            close(sock);
-            sock = -1;
-        }
-    }
-
-    TestClient(const TestClient&) = delete;
-    TestClient& operator=(const TestClient&) = delete;
-};
+using TestClient = bot::Bot;
 
 // ---------- frame helpers ----------
-
-// Waits up to `ms` for the next frame. False on timeout or closed connection.
-bool nextFrame(int sock, MsgType& type, string& body, int ms = WAIT_MS)
-{
-    pollfd p{sock, POLLIN, 0};
-    if (poll(&p, 1, ms) <= 0)
-    {
-        return false;
-    }
-    return receiveFrame(sock, type, body);
-}
 
 // Reads the next frame, requires it to be of type `want`, and returns its body.
 string expectFrame(int sock, MsgType want)
 {
-    MsgType type{};
     string body;
-    REQUIRE(nextFrame(sock, type, body));
-    REQUIRE(static_cast<int>(type) == static_cast<int>(want));
+    REQUIRE_MESSAGE(bot::expectFrame(sock, want, body), bot::lastError());
     return body;
 }
 
@@ -308,139 +251,12 @@ void sendRaw(int sock, const vector<unsigned char>& bytes)
 
 // ---------- protocol steps ----------
 
-// Connects and runs the full login. Returns the USER_LIST the server sends.
+// Connects and logs in. Returns the USER_LIST the server sends.
 set<PeerId> login(TestClient& c, int port)
 {
-    c.sock = connectTo(port);
-    REQUIRE(c.sock >= 0);
-
-    string challengeBody = expectFrame(c.sock, MsgType::CHALLENGE);
-    REQUIRE(challengeBody.size() == CHALLENGE_BYTES);
-
-    array<unsigned char, CHALLENGE_BYTES> challenge{};
-    memcpy(challenge.data(), challengeBody.data(), challenge.size());
-
-    unsigned char sig[crypto_sign_BYTES];
-    REQUIRE(signLogin(c.id, challenge, sig));
-
-    vector<unsigned char> auth(c.id.pk, c.id.pk + crypto_sign_PUBLICKEYBYTES);
-    auth.insert(auth.end(), sig, sig + crypto_sign_BYTES);
-    REQUIRE(sendFrame(c.sock, MsgType::AUTH, auth));
-
-    expectFrame(c.sock, MsgType::AUTH_OK);
-
     set<PeerId> online;
-    REQUIRE(parseUserList(expectFrame(c.sock, MsgType::USER_LIST), online));
+    REQUIRE_MESSAGE(bot::login(c, "127.0.0.1", port, &online), bot::lastError());
     return online;
-}
-
-// Role for crypto_kx: the lower identity key is the initiator (same rule as the client).
-bool isInitiator(const TestClient& me, const PeerId& peer)
-{
-    return memcmp(me.id.pk, peer.data(), PeerId{}.size()) < 0;
-}
-
-// Sends a signed offer from `from` to `to`: [OFFER][offer key][sig]. Leaves `s` in OFFERED.
-void sendOffer(const TestClient& from, const PeerId& to, Session& s)
-{
-    wipeSession(s);
-    s.isInitiator = isInitiator(from, to);
-    makeKeyPair(s);
-
-    unsigned char sig[crypto_sign_BYTES];
-    REQUIRE(signOffer(from.id, to.data(), s.pk, sig));
-
-    vector<unsigned char> payload{static_cast<unsigned char>(HandshakeType::OFFER)};
-    payload.insert(payload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);
-    payload.insert(payload.end(), sig, sig + crypto_sign_BYTES);
-    REQUIRE(payload.size() == OFFER_PAYLOAD_SIZE);
-
-    REQUIRE(sendFrame(from.sock, MsgType::HANDSHAKE, buildBody(to, payload)));
-    s.state = SessionState::OFFERED;
-}
-
-// Receives an offer, checks the server stamped the right sender and the signature
-// is valid for us. Returns the offered key.
-string receiveOffer(const TestClient& me, const PeerId& expectedSender)
-{
-    PeerId sender{};
-    vector<unsigned char> payload;
-    REQUIRE(parseBody(expectFrame(me.sock, MsgType::HANDSHAKE), sender, payload));
-    CHECK(sender == expectedSender);
-
-    REQUIRE(payload.size() == OFFER_PAYLOAD_SIZE);
-    REQUIRE(payload[0] == static_cast<unsigned char>(HandshakeType::OFFER));
-
-    const unsigned char* offerPk = payload.data() + 1;
-    const unsigned char* sig = offerPk + crypto_kx_PUBLICKEYBYTES;
-    REQUIRE(verifyOffer(sender.data(), me.id.pk, offerPk, sig));
-
-    return string(offerPk, offerPk + crypto_kx_PUBLICKEYBYTES);
-}
-
-// Answers `offerPk` from `from` to `to`: derives keys, then sends
-// [REPLY][reply key][answered offer key][sig]. Leaves `s` in READY.
-void sendReply(const TestClient& from, const PeerId& to, Session& s, const string& offerPk)
-{
-    REQUIRE(offerPk.size() == crypto_kx_PUBLICKEYBYTES);
-    const auto* answered = reinterpret_cast<const unsigned char*>(offerPk.data());
-
-    wipeSession(s);
-    s.isInitiator = isInitiator(from, to);
-    makeKeyPair(s);
-    REQUIRE(deriveSessionKeys(s, offerPk));
-
-    unsigned char sig[crypto_sign_BYTES];
-    REQUIRE(signReply(from.id, to.data(), s.pk, answered, sig));
-
-    vector<unsigned char> payload{static_cast<unsigned char>(HandshakeType::REPLY)};
-    payload.insert(payload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);
-    payload.insert(payload.end(), answered, answered + crypto_kx_PUBLICKEYBYTES);
-    payload.insert(payload.end(), sig, sig + crypto_sign_BYTES);
-    REQUIRE(payload.size() == REPLY_PAYLOAD_SIZE);
-
-    REQUIRE(sendFrame(from.sock, MsgType::HANDSHAKE, buildBody(to, payload)));
-    s.state = SessionState::READY;
-}
-
-// Receives a reply, checks the sender, the signature, and that it answers OUR
-// current offer (`myOfferPk`). Returns the reply key.
-string receiveReply(const TestClient& me, const PeerId& expectedSender, const unsigned char* myOfferPk)
-{
-    PeerId sender{};
-    vector<unsigned char> payload;
-    REQUIRE(parseBody(expectFrame(me.sock, MsgType::HANDSHAKE), sender, payload));
-    CHECK(sender == expectedSender);
-
-    REQUIRE(payload.size() == REPLY_PAYLOAD_SIZE);
-    REQUIRE(payload[0] == static_cast<unsigned char>(HandshakeType::REPLY));
-
-    const unsigned char* replyPk = payload.data() + 1;
-    const unsigned char* answeredPk = replyPk + crypto_kx_PUBLICKEYBYTES;
-    const unsigned char* sig = answeredPk + crypto_kx_PUBLICKEYBYTES;
-    REQUIRE(verifyReply(sender.data(), me.id.pk, replyPk, answeredPk, sig));
-    CHECK(memcmp(answeredPk, myOfferPk, crypto_kx_PUBLICKEYBYTES) == 0);
-
-    return string(replyPk, replyPk + crypto_kx_PUBLICKEYBYTES);
-}
-
-void sendMessage(const TestClient& from, const PeerId& to, const Session& s, const string& text)
-{
-    vector<unsigned char> encrypted;
-    REQUIRE(encrypt(text, encrypted, s.tx));
-    REQUIRE(sendFrame(from.sock, MsgType::MESSAGE, buildBody(to, encrypted)));
-}
-
-string receiveMessage(const TestClient& me, const PeerId& expectedSender, const Session& s)
-{
-    PeerId sender{};
-    vector<unsigned char> payload;
-    REQUIRE(parseBody(expectFrame(me.sock, MsgType::MESSAGE), sender, payload));
-    CHECK(sender == expectedSender);
-
-    vector<unsigned char> plain;
-    REQUIRE(decrypt(plain, string(payload.begin(), payload.end()), s.rx));
-    return string(plain.begin(), plain.end());
 }
 
 } // namespace
@@ -465,27 +281,20 @@ TEST_CASE("integration: login, presence, signed handshake and private messages")
     CHECK(toPeerId(expectFrame(bob.sock, MsgType::USER_ONLINE)) == carol.pid);
 
     // --- signed offer and reply, the same order the real client uses ---
+    // (alice offers, bob verifies and replies, alice checks it answers her offer and derives)
     Session aliceSession, bobSession;
-
-    sendOffer(alice, bob.pid, aliceSession);                              // alice: /chat bob
-
-    string aliceOffer = receiveOffer(bob, alice.pid);                     // bob: verify the offer
-    sendReply(bob, alice.pid, bobSession, aliceOffer);                    // bob: answer it
-
-    string bobReply = receiveReply(alice, bob.pid, aliceSession.pk);      // alice: verify, check it answers her offer
-    REQUIRE(deriveSessionKeys(aliceSession, bobReply));
-    aliceSession.state = SessionState::READY;
+    REQUIRE_MESSAGE(bot::handshake(alice, aliceSession, bob, bobSession), bot::lastError());
 
     CHECK(memcmp(aliceSession.tx, bobSession.rx, crypto_kx_SESSIONKEYBYTES) == 0);
     CHECK(memcmp(bobSession.tx, aliceSession.rx, crypto_kx_SESSIONKEYBYTES) == 0);
     CHECK(sessionFingerPrint(aliceSession) == sessionFingerPrint(bobSession));
 
     // --- encrypted messages both ways ---
-    sendMessage(alice, bob.pid, aliceSession, "alice : hi bob");
-    CHECK(receiveMessage(bob, alice.pid, bobSession) == "alice : hi bob");
+    REQUIRE(bot::sendMessage(alice, bob.pid, aliceSession, "alice : hi bob"));
+    CHECK(bot::receiveMessage(bob, alice.pid, bobSession) == "alice : hi bob");
 
-    sendMessage(bob, alice.pid, bobSession, "bob : hi alice");
-    CHECK(receiveMessage(alice, bob.pid, aliceSession) == "bob : hi alice");
+    REQUIRE(bot::sendMessage(bob, alice.pid, bobSession, "bob : hi alice"));
+    CHECK(bot::receiveMessage(alice, bob.pid, aliceSession) == "bob : hi alice");
 
     // --- carol saw none of it ---
     CHECK(nothingArrives(carol.sock));
