@@ -17,6 +17,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 
 #include "net.hpp"
 #include "crypto.hpp"
@@ -41,14 +42,53 @@ struct Connection
     bool send(MsgType type, const vector<unsigned char>& body)
     {
         lock_guard<mutex> lock(sendMutex);
-        return sendFrame(sock, type, body);
+        return sendLocked(type, body);
+    }
+
+    bool sendLocked(MsgType type, const vector<unsigned char>& body)
+    {
+        if (!sendFrame(sock, type, body))
+        {
+            shutdown();
+            return false;
+        }
+        return true;
     }
 };
 
 using ClientMap = map<PeerId, shared_ptr<Connection>>;   // logged-in user ID -> connection
 
+constexpr int SEND_TIMEOUT_MS = 2000;
+
 mutex clientsMutex;
 mutex coutMutex;
+
+// users whose disconnect is still being announced; can't log in again until that's done
+set<PeerId> leaving;
+
+vector<shared_ptr<Connection>> othersLocked(const ClientMap& clients, const PeerId& self)
+{
+    vector<shared_ptr<Connection>> others;
+    others.reserve(clients.size());
+    for (const auto& [id, conn] : clients)
+    {
+        if (id != self)
+        {
+            others.push_back(conn);
+        }
+    }
+    return others;
+}
+
+// send the same frame to each connection
+void broadcast(const vector<shared_ptr<Connection>>& to, MsgType type,
+               const vector<unsigned char>& body)
+{
+    for (const auto& conn : to)
+    {
+        conn->send(type, body);
+    }
+}
 
 void rejectClient(Connection& conn, const string& reason)
 {
@@ -56,17 +96,19 @@ void rejectClient(Connection& conn, const string& reason)
     conn.send(MsgType::ERROR_MSG, msg);
 }
 
-bool sendUserList(Connection& conn, const PeerId& selfId, const ClientMap& inputMap)
+
+vector<unsigned char> userListLocked(const PeerId& self, const ClientMap& clients)
 {
     vector<unsigned char> payload;
-    payload.reserve(inputMap.size() * 32);
-    for (auto& cli : inputMap) 
-    {   
-        if (cli.first == selfId) { continue; }
-        payload.insert(payload.end(), cli.first.begin(), cli.first.end());
+    payload.reserve(clients.size() * 32);
+    for (const auto& [id, conn] : clients)
+    {
+        if (id != self)
+        {
+            payload.insert(payload.end(), id.begin(), id.end());
+        }
     }
-
-    return conn.send(MsgType::USER_LIST, payload);
+    return payload;
 }
 
 
@@ -119,40 +161,45 @@ void clientHandler(int clientSocket, ClientMap& clients)
         return;
     }
 
+    // hold our own send lock from before anyone can find us in the map until our login frames are out
+    unique_lock<mutex> loginFrames(conn->sendMutex);
+
+    bool duplicate = false;
+    vector<unsigned char> userList;
+    vector<shared_ptr<Connection>> others;   // who to tell that we're online
     {
         lock_guard<mutex> lock(clientsMutex);
-
-        if (clients.count(clientId) > 0)
+        if (clients.count(clientId) > 0 || leaving.count(clientId) > 0)
         {
-            rejectClient(*conn, "Already logged in.");
-            return;
+            duplicate = true;
         }
-
-        if (!conn->send(MsgType::AUTH_OK, {}))
+        else
         {
-            return;
+            userList = userListLocked(clientId, clients);
+            others = othersLocked(clients, clientId);
+            clients[clientId] = conn;
         }
-
-        clients[clientId] = conn;
-        // send user list of all clients
-        if (!sendUserList(*conn, clientId, clients))
-        {   
-            clients.erase(clientId);
-            return;
-        }
-
-        // send every other user that the curr user is online 
-        vector<unsigned char> idPayload(clientId.begin(), clientId.end());
-        for (const auto & [otherId, other] : clients)
-	    {
-            if (otherId == clientId) { continue; }
-	    	if (!other->send(MsgType::USER_ONLINE, idPayload))
-	    	{
-                lock_guard<mutex> lock(coutMutex);
-	    		cerr << "Failed to send message to client" << endl;
-	    	}
-	    }
     }
+
+    if (duplicate)
+    {
+        loginFrames.unlock();
+        rejectClient(*conn, "Already logged in.");
+        return;
+    }
+
+    if (!conn->sendLocked(MsgType::AUTH_OK, {}) ||
+        !conn->sendLocked(MsgType::USER_LIST, userList))
+    {
+        // noone was told we're online yet, so just take us out of the map again
+        lock_guard<mutex> lock(clientsMutex);
+        clients.erase(clientId);
+        return;
+    }
+    loginFrames.unlock();
+
+    vector<unsigned char> idPayload(clientId.begin(), clientId.end());
+    broadcast(others, MsgType::USER_ONLINE, idPayload);
 
     {
 		lock_guard<mutex> lock(coutMutex);
@@ -215,24 +262,23 @@ void clientHandler(int clientSocket, ClientMap& clients)
         }
     }
 
-	{
-		lock_guard<mutex> lock(clientsMutex);
-		clients.erase(clientId);
-
-        // send USER OFFLINE to remaining clients
-        vector<unsigned char> idPayload(clientId.begin(), clientId.end());
-        for (const auto & [otherId, other] : clients)
-	    {
-	    	if (!other->send(MsgType::USER_OFFLINE, idPayload))
-	    	{
-                lock_guard<mutex> lock(coutMutex);
-	    		cerr << "Failed to send message to client" << endl;
-	    	}
-	    }
-	}
-
     // cut connection now so client sees it closed even if another thread still holds shared_ptr to it
     conn->shutdown();
+
+    // leave the map under the lock; announce it after unlocking.
+    vector<shared_ptr<Connection>> remaining;
+    {
+        lock_guard<mutex> lock(clientsMutex);
+        clients.erase(clientId);
+        leaving.insert(clientId);
+        remaining = othersLocked(clients, clientId);
+    }
+    broadcast(remaining, MsgType::USER_OFFLINE, idPayload);
+    {
+        lock_guard<mutex> lock(clientsMutex);
+        leaving.erase(clientId);   // now the same user may log in again
+    }
+
     {
         lock_guard<mutex> lock(coutMutex);
         cout << "Client disconnected" << endl;
@@ -316,10 +362,16 @@ int main(int argc, char* argv[])
             perror("Accept");
             continue;
         }
-        
         if (!setNoDelay(clientSocket))
         {
             perror("setsockopt(TCP_NODELAY)");
+        }
+
+        // client that stops reading can't hold up a thread forever.
+        timeval sendTimeout{SEND_TIMEOUT_MS / 1000, (SEND_TIMEOUT_MS % 1000) * 1000};
+        if (setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout)) < 0)
+        {
+            perror("setsockopt(SO_SNDTIMEO)");
         }
 
 		thread cli(clientHandler, clientSocket, ref(clients));
