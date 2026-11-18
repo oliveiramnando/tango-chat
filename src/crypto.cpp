@@ -116,18 +116,6 @@ vector<unsigned char> buildHandshakeMessage(std::string_view label, const unsign
     return msg;
 }
 
-bool signHandshake(const Identity& me, const unsigned char* recipientPk, const unsigned char* ephPk, unsigned char sig[crypto_sign_BYTES])
-{
-    vector<unsigned char> handshakeMsg = buildHandshakeMessage(HANDSHAKE_LABEL, me.pk, recipientPk, ephPk);
-    return crypto_sign_detached(sig, nullptr, handshakeMsg.data(), handshakeMsg.size(), me.sk) == 0;
-}
-
-bool verifyHandshake(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* sig)
-{
-    vector<unsigned char> handshakeMsg = buildHandshakeMessage(HANDSHAKE_LABEL, senderPk, recipientPk, ephPk);
-    return crypto_sign_verify_detached(sig, handshakeMsg.data(), handshakeMsg.size(), senderPk) == 0;
-}
-
 bool signOffer(const Identity& me, const unsigned char* recipientPk, const unsigned char* offerPk, unsigned char sig[crypto_sign_BYTES])
 {
     vector<unsigned char> handshakeMsg = buildHandshakeMessage(OFFER_LABEL, me.pk, recipientPk, offerPk);
@@ -151,6 +139,7 @@ bool verifyReply(const unsigned char* senderPk, const unsigned char* recipientPk
     vector<unsigned char> handshakeMsg = buildHandshakeMessage(REPLY_LABEL, senderPk, recipientPk, replyPk, answeredPk);
     return crypto_sign_verify_detached(sig, handshakeMsg.data(), handshakeMsg.size(), senderPk) == 0;
 }
+
 
 bool signLogin(const Identity& id, const array<unsigned char, CHALLENGE_BYTES>& challenge, unsigned char signature[crypto_sign_BYTES])
 {
@@ -192,7 +181,6 @@ void makeKeyPair(Session &s)
 {
     crypto_kx_keypair(s.pk, s.sk);
     s.hasKeyPair = true;
-    s.ready = false;
 }
 
 bool deriveSessionKeys(Session &s, const string &peerPk)
@@ -237,13 +225,10 @@ void wipeSession(Session &s)
     sodium_memzero(s.peerPk, crypto_kx_PUBLICKEYBYTES);
 
     s.hasKeyPair = false;
-    s.ready = false;
 
     s.isInitiator = false;
 
     s.state = SessionState::NONE;
-
-    s.handshakeTime = {};
 }
 
 

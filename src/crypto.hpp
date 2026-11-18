@@ -5,11 +5,9 @@
 #include <vector>
 #include <cstdint>
 #include <sodium.h>
-#include <chrono>
 
 #include "net.hpp"
 
-constexpr std::size_t HANDSHAKE_PAYLOAD_SIZE = crypto_kx_PUBLICKEYBYTES + crypto_sign_BYTES;  // 96 
 constexpr std::size_t OFFER_PAYLOAD_SIZE = 1 + crypto_kx_PUBLICKEYBYTES + crypto_sign_BYTES;  // 97
 constexpr std::size_t REPLY_PAYLOAD_SIZE = 1 + crypto_kx_PUBLICKEYBYTES*2 + crypto_sign_BYTES;  // 129 
 
@@ -35,23 +33,15 @@ struct Session
     unsigned char peerPk[crypto_kx_PUBLICKEYBYTES]{};
 
     bool hasKeyPair = false;
-    bool ready = false;
 
     bool isInitiator = false;
 
     SessionState state = SessionState::NONE;
-
-    std::chrono::steady_clock::time_point handshakeTime{};
 };
 
 bool loadOrCreateIdentity(const std::string& path, Identity& id);
 
 std::vector<unsigned char> buildHandshakeMessage(std::string_view label, const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* answeredPk = nullptr);
-
-bool signHandshake(const Identity& me, const unsigned char* recipientPk, const unsigned char* ephPk, unsigned char sig[crypto_sign_BYTES]);
-bool verifyHandshake(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* ephPk, const unsigned char* sig);
-
-
 bool signOffer(const Identity& me, const unsigned char* recipientPk, const unsigned char* offerPk, unsigned char sig[crypto_sign_BYTES]);
 bool verifyOffer(const unsigned char* senderPk, const unsigned char* recipientPk, const unsigned char* offerPk, const unsigned char* sig);
 
