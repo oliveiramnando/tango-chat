@@ -96,7 +96,7 @@ make test
 This builds the server, then builds `run_tests` from every `tests/test_*.cpp` file with AddressSanitizer and UndefinedBehaviorSanitizer enabled, and runs it:
 
 - **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, message numbering (replays, gaps, altered counters and IDs), the contacts file, name and command parsing, and cleaning received text for the terminal.
-- **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejection of a message delivered twice, rejected logins, offline recipients, a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
+- **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejection of a message delivered twice, rejected logins, offline recipients (`USER_NOT_FOUND`), a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
 
 The sanitizers fail the run at the first out-of-bounds memory access or undefined behavior, even if every check would otherwise pass.
 
@@ -304,13 +304,14 @@ Relayed frames carry an **addressed body**: `[32-byte peer ID][payload]`. From c
 | `MESSAGE` | 1 | client (relayed) | `[peer ID][8-byte counter][24-byte nonce][ciphertext][16-byte tag]` |
 | `HANDSHAKE` | 2 | client (relayed) | `[peer ID][payload]`; see below |
 | — | 3, 4 | — | Reserved (formerly `PEER_JOINED`/`PEER_LEFT`, no longer used) |
-| `ERROR_MSG` | 5 | server only | Error text (e.g. "Server full."), or the 32-byte ID of a recipient who is not online |
+| `ERROR_MSG` | 5 | server only | Error text (e.g. "Server full.") |
 | `CHALLENGE` | 6 | server only | 32 random bytes |
 | `AUTH` | 7 | client only | `[32-byte Ed25519 public key][64-byte signature]` |
 | `AUTH_OK` | 8 | server only | Empty |
 | `USER_LIST` | 9 | server only | `[1 byte: 1 if another USER_LIST follows, 0 if last][up to 255 IDs of 32 bytes]` |
 | `USER_ONLINE` | 10 | server only | 32-byte ID |
 | `USER_OFFLINE` | 11 | server only | 32-byte ID |
+| `USER_NOT_FOUND` | 12 | server only | 32-byte ID of a recipient who is not online, so a relayed frame could not be delivered |
 
 A `HANDSHAKE` payload starts with a kind byte:
 
@@ -430,7 +431,7 @@ Do not rely on this project to protect sensitive information.
 - [x] Login timeout, connection cap, and user lists longer than one frame
 - [ ] Freshness check for offers, so a replayed old offer is rejected
 - [ ] Split the client into a core and a front end, with unit tests for the handshake rules
-- [ ] Dedicated "user not found" frame type instead of `ERROR_MSG`
+- [x] Dedicated `USER_NOT_FOUND` frame type instead of `ERROR_MSG`
 - [x] Message counters and additional data: replayed, reordered and dropped messages are detected
 - [x] Clean received text before printing it, so messages can't inject terminal control sequences
 - [ ] Full-screen terminal UI

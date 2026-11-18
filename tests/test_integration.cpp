@@ -368,7 +368,7 @@ TEST_CASE("integration: login with a bad signature or a duplicate identity is re
     CHECK(server.alive());
 }
 
-TEST_CASE("integration: sending to an offline user returns that user's ID")
+TEST_CASE("integration: sending to an offline user returns USER_NOT_FOUND with that user's ID")
 {
     ServerProcess server;
     REQUIRE_MESSAGE(server.ready, server.diagnosis());
@@ -380,7 +380,11 @@ TEST_CASE("integration: sending to an offline user returns that user's ID")
     ghost.fill(0x42);
     REQUIRE(sendFrame(alice.sock, MsgType::MESSAGE, buildBody(ghost, {1, 2, 3})));
 
-    CHECK(toPeerId(expectFrame(alice.sock, MsgType::ERROR_MSG)) == ghost);
+    CHECK(toPeerId(expectFrame(alice.sock, MsgType::USER_NOT_FOUND)) == ghost);
+
+    // the same for a handshake
+    REQUIRE(sendFrame(alice.sock, MsgType::HANDSHAKE, buildBody(ghost, {2, 0})));
+    CHECK(toPeerId(expectFrame(alice.sock, MsgType::USER_NOT_FOUND)) == ghost);
 
     // Alice is still connected and still gets presence updates.
     TestClient bob;

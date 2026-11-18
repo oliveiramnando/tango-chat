@@ -240,7 +240,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     string name = nameAndMessage.substr(0, colonIdx);
                     string message = nameAndMessage.substr(colonIdx + 3);
                         
-                    cout << "\033[94m" << displayName(contacts, sender) << "\033[0m : " << message << endl;
+                    cout << "\033[94m" << displayName(contacts, sender) << "\033[0m : " << sanitizeForTerminal(message) << endl;
                     redrawPrompt();
                 }
                 continue;
@@ -394,7 +394,32 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                 {
                     lock_guard<mutex> lock(terminalMutex);
                     cout << "\r\033[K";
-                    cerr << body << endl;
+                    cerr << sanitizeForTerminal(body) << endl;
+                    redrawPrompt();
+                }
+                continue;
+            case MsgType::USER_NOT_FOUND:
+                {
+                    // server couldn't deliver to this user: they're not online
+                    lock_guard<mutex> lock(terminalMutex);
+                    cout << "\r\033[K";
+                    PeerId missing{};
+                    if (body.size() != missing.size())
+                    {
+                        cerr << "Malformed USER_NOT_FOUND received." << endl;
+                        redrawPrompt();
+                        continue;
+                    }
+                    memcpy(missing.data(), body.data(), missing.size());
+                    cerr << displayName(contacts, missing) << " is not online." << endl;
+
+                    // any session with them is stale
+                    auto it = sessions.find(missing);
+                    if (it != sessions.end())
+                    {
+                        wipeSession(it->second);
+                        sessions.erase(it);
+                    }
                     redrawPrompt();
                 }
                 continue;
@@ -960,7 +985,7 @@ int main(int argc, char* argv[])
     }
     if (type == MsgType::ERROR_MSG)
     {
-        cerr << "Login failed: " << body << endl;
+        cerr << "Login failed: " << sanitizeForTerminal(body) << endl;
         return 1;
     }
     if (type != MsgType::AUTH_OK)

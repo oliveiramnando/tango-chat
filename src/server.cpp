@@ -278,7 +278,7 @@ void clientHandler(int clientSocket, ClientMap& clients)
         if (!recipient)
         {
             vector<unsigned char> missingId(recipientId.begin(), recipientId.end());
-            if (!conn->send(MsgType::ERROR_MSG, missingId))
+            if (!conn->send(MsgType::USER_NOT_FOUND, missingId))
             {
                 break;
             }

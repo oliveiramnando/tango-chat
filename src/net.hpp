@@ -30,6 +30,7 @@ enum class MsgType : uint8_t {
     USER_LIST=9,
     USER_ONLINE=10,
     USER_OFFLINE=11,
+    USER_NOT_FOUND=12,
 };
 
 enum class HandshakeType : uint8_t {
