@@ -4,8 +4,8 @@
 // Run from the project root after building the server (make test does both).
 
 #include "doctest.h"
-#include "../src/net.hpp"
-#include "../src/crypto.hpp"
+#include "net.hpp"
+#include "crypto.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -334,35 +334,94 @@ set<PeerId> login(TestClient& c, int port)
     return online;
 }
 
-// Makes a key pair in `s` and sends a signed HANDSHAKE from `from` to `to`.
-void sendHandshake(const TestClient& from, const PeerId& to, Session& s)
+// Role for crypto_kx: the lower identity key is the initiator (same rule as the client).
+bool isInitiator(const TestClient& me, const PeerId& peer)
 {
-    s.isInitiator = memcmp(from.id.pk, to.data(), PeerId{}.size()) < 0;
+    return memcmp(me.id.pk, peer.data(), PeerId{}.size()) < 0;
+}
+
+// Sends a signed offer from `from` to `to`: [OFFER][offer key][sig]. Leaves `s` in OFFERED.
+void sendOffer(const TestClient& from, const PeerId& to, Session& s)
+{
+    wipeSession(s);
+    s.isInitiator = isInitiator(from, to);
     makeKeyPair(s);
 
     unsigned char sig[crypto_sign_BYTES];
-    REQUIRE(signHandshake(from.id, to.data(), s.pk, sig));
+    REQUIRE(signOffer(from.id, to.data(), s.pk, sig));
 
-    vector<unsigned char> payload(s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);
+    vector<unsigned char> payload{static_cast<unsigned char>(HandshakeType::OFFER)};
+    payload.insert(payload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);
     payload.insert(payload.end(), sig, sig + crypto_sign_BYTES);
+    REQUIRE(payload.size() == OFFER_PAYLOAD_SIZE);
+
     REQUIRE(sendFrame(from.sock, MsgType::HANDSHAKE, buildBody(to, payload)));
+    s.state = SessionState::OFFERED;
 }
 
-// Receives a HANDSHAKE, checks the server stamped the right sender and the
-// signature is valid for us. Returns the sender's ephemeral public key.
-string receiveVerifiedHandshake(const TestClient& me, const PeerId& expectedSender)
+// Receives an offer, checks the server stamped the right sender and the signature
+// is valid for us. Returns the offered key.
+string receiveOffer(const TestClient& me, const PeerId& expectedSender)
 {
     PeerId sender{};
     vector<unsigned char> payload;
     REQUIRE(parseBody(expectFrame(me.sock, MsgType::HANDSHAKE), sender, payload));
     CHECK(sender == expectedSender);
-    REQUIRE(payload.size() == HANDSHAKE_PAYLOAD_SIZE);
 
-    const unsigned char* ephPk = payload.data();
-    const unsigned char* sig = ephPk + crypto_kx_PUBLICKEYBYTES;
-    REQUIRE(verifyHandshake(sender.data(), me.id.pk, ephPk, sig));
+    REQUIRE(payload.size() == OFFER_PAYLOAD_SIZE);
+    REQUIRE(payload[0] == static_cast<unsigned char>(HandshakeType::OFFER));
 
-    return string(ephPk, ephPk + crypto_kx_PUBLICKEYBYTES);
+    const unsigned char* offerPk = payload.data() + 1;
+    const unsigned char* sig = offerPk + crypto_kx_PUBLICKEYBYTES;
+    REQUIRE(verifyOffer(sender.data(), me.id.pk, offerPk, sig));
+
+    return string(offerPk, offerPk + crypto_kx_PUBLICKEYBYTES);
+}
+
+// Answers `offerPk` from `from` to `to`: derives keys, then sends
+// [REPLY][reply key][answered offer key][sig]. Leaves `s` in READY.
+void sendReply(const TestClient& from, const PeerId& to, Session& s, const string& offerPk)
+{
+    REQUIRE(offerPk.size() == crypto_kx_PUBLICKEYBYTES);
+    const auto* answered = reinterpret_cast<const unsigned char*>(offerPk.data());
+
+    wipeSession(s);
+    s.isInitiator = isInitiator(from, to);
+    makeKeyPair(s);
+    REQUIRE(deriveSessionKeys(s, offerPk));
+
+    unsigned char sig[crypto_sign_BYTES];
+    REQUIRE(signReply(from.id, to.data(), s.pk, answered, sig));
+
+    vector<unsigned char> payload{static_cast<unsigned char>(HandshakeType::REPLY)};
+    payload.insert(payload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);
+    payload.insert(payload.end(), answered, answered + crypto_kx_PUBLICKEYBYTES);
+    payload.insert(payload.end(), sig, sig + crypto_sign_BYTES);
+    REQUIRE(payload.size() == REPLY_PAYLOAD_SIZE);
+
+    REQUIRE(sendFrame(from.sock, MsgType::HANDSHAKE, buildBody(to, payload)));
+    s.state = SessionState::READY;
+}
+
+// Receives a reply, checks the sender, the signature, and that it answers OUR
+// current offer (`myOfferPk`). Returns the reply key.
+string receiveReply(const TestClient& me, const PeerId& expectedSender, const unsigned char* myOfferPk)
+{
+    PeerId sender{};
+    vector<unsigned char> payload;
+    REQUIRE(parseBody(expectFrame(me.sock, MsgType::HANDSHAKE), sender, payload));
+    CHECK(sender == expectedSender);
+
+    REQUIRE(payload.size() == REPLY_PAYLOAD_SIZE);
+    REQUIRE(payload[0] == static_cast<unsigned char>(HandshakeType::REPLY));
+
+    const unsigned char* replyPk = payload.data() + 1;
+    const unsigned char* answeredPk = replyPk + crypto_kx_PUBLICKEYBYTES;
+    const unsigned char* sig = answeredPk + crypto_kx_PUBLICKEYBYTES;
+    REQUIRE(verifyReply(sender.data(), me.id.pk, replyPk, answeredPk, sig));
+    CHECK(memcmp(answeredPk, myOfferPk, crypto_kx_PUBLICKEYBYTES) == 0);
+
+    return string(replyPk, replyPk + crypto_kx_PUBLICKEYBYTES);
 }
 
 void sendMessage(const TestClient& from, const PeerId& to, const Session& s, const string& text)
@@ -405,17 +464,17 @@ TEST_CASE("integration: login, presence, signed handshake and private messages")
     CHECK(toPeerId(expectFrame(alice.sock, MsgType::USER_ONLINE)) == carol.pid);
     CHECK(toPeerId(expectFrame(bob.sock, MsgType::USER_ONLINE)) == carol.pid);
 
-    // --- signed handshake, the same order the real client uses ---
+    // --- signed offer and reply, the same order the real client uses ---
     Session aliceSession, bobSession;
 
-    sendHandshake(alice, bob.pid, aliceSession);                     // alice: /chat bob
+    sendOffer(alice, bob.pid, aliceSession);                              // alice: /chat bob
 
-    string aliceEph = receiveVerifiedHandshake(bob, alice.pid);       // bob: verify first
-    sendHandshake(bob, alice.pid, bobSession);                        // bob: reply
-    REQUIRE(deriveSessionKeys(bobSession, aliceEph));
+    string aliceOffer = receiveOffer(bob, alice.pid);                     // bob: verify the offer
+    sendReply(bob, alice.pid, bobSession, aliceOffer);                    // bob: answer it
 
-    string bobEph = receiveVerifiedHandshake(alice, bob.pid);         // alice: verify reply
-    REQUIRE(deriveSessionKeys(aliceSession, bobEph));
+    string bobReply = receiveReply(alice, bob.pid, aliceSession.pk);      // alice: verify, check it answers her offer
+    REQUIRE(deriveSessionKeys(aliceSession, bobReply));
+    aliceSession.state = SessionState::READY;
 
     CHECK(memcmp(aliceSession.tx, bobSession.rx, crypto_kx_SESSIONKEYBYTES) == 0);
     CHECK(memcmp(bobSession.tx, aliceSession.rx, crypto_kx_SESSIONKEYBYTES) == 0);
