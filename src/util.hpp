@@ -10,4 +10,6 @@ bool isValidName(const std::string& name);
 std::vector<std::string> splitWords(const std::string& text);
 std::optional<size_t> parseListNumber(const std::string& text, size_t count);
 
+std::string sanitizeForTerminal(const std::string& text);
+
 #endif

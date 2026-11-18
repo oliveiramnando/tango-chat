@@ -14,6 +14,7 @@ The server authenticates users and routes frames, but it never holds conversatio
 - **Contacts:** After comparing fingerprints with someone out of band, you save their ID under a name with `/add`. Contacts are stored per profile and shown by name everywhere: in `/users`, in connection messages and on every incoming message.
 - **Contacts-only conversations:** `/chat` only accepts saved contacts, and handshakes from anyone else are ignored, with a one-time notice per person. Both people must add each other before they can talk, which makes the fingerprint check a required step.
 - **Trustworthy sender labels:** Incoming messages are labeled with the name *you* saved for the sender's ID, not a name the sender chose.
+- **Safe terminal output:** Text from other users and from the server is cleaned before it is printed. Control characters (such as escape sequences and newlines), Unicode direction overrides and invalid UTF-8 are shown as `?`, so a message can't redraw the screen, fake a line from another contact, or fake a security notice.
 - **Live presence:** The server sends the list of online users at login (split over several frames when it is long), then notifies clients as users come online or go offline, always in order.
 - **Signed offer/reply handshakes:** A conversation starts with a signed *offer* and is answered with a signed *reply* that names the offer it answers, so neither side ever has to guess what a handshake means. Both are bound to both users' IDs, and the receiver verifies the signature before touching any session, so forged, altered, redirected or stale handshakes are rejected and cannot disturb an existing conversation.
 - **Reliable connection setup:** If both people start a chat at the same moment, the two offers are resolved the same way on both sides. If a handshake gets no reply (for example because the peer had not added you yet), running `/chat` again sends a fresh offer straight away.
@@ -94,7 +95,7 @@ make test
 
 This builds the server, then builds `run_tests` from every `tests/test_*.cpp` file with AddressSanitizer and UndefinedBehaviorSanitizer enabled, and runs it:
 
-- **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, message numbering (replays, gaps, altered counters and IDs), the contacts file, and name and command parsing.
+- **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, message numbering (replays, gaps, altered counters and IDs), the contacts file, name and command parsing, and cleaning received text for the terminal.
 - **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejection of a message delivered twice, rejected logins, offline recipients, a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
 
 The sanitizers fail the run at the first out-of-bounds memory access or undefined behavior, even if every check would otherwise pass.
@@ -368,7 +369,7 @@ tcp-chat/
 │   ├── botclient.hpp
 │   ├── net.cpp             # Framing, addressed bodies, split user lists, socket helpers, TCP_NODELAY
 │   ├── net.hpp             # Message and handshake types, peer IDs, labels, limits, networking declarations
-│   ├── util.cpp            # Name validation and command parsing
+│   ├── util.cpp            # Name validation, command parsing, cleaning received text for the terminal
 │   └── util.hpp
 ├── tests/
 │   ├── doctest.h           # Test framework (single header)
@@ -431,6 +432,7 @@ Do not rely on this project to protect sensitive information.
 - [ ] Split the client into a core and a front end, with unit tests for the handshake rules
 - [ ] Dedicated "user not found" frame type instead of `ERROR_MSG`
 - [x] Message counters and additional data: replayed, reordered and dropped messages are detected
+- [x] Clean received text before printing it, so messages can't inject terminal control sequences
 - [ ] Full-screen terminal UI
 - [ ] `make install`, standard config and data paths, releases and a Homebrew tap
 - [ ] Group chat
