@@ -5,7 +5,7 @@
 
 #include "crypto.hpp"
 
-using Key = std::array<unsigned char, 32>;
+using HandshakeKey = std::array<unsigned char, 32>;
 
 enum class HandshakeAction
 {
@@ -18,8 +18,8 @@ enum class HandshakeAction
 struct IncomingHandshake
 {
     HandshakeType kind;
-    Key key;    // their offer key, or reply key
-    Key answered;   // reply key only: offer key answered by this key
+    HandshakeKey key{};         // their offer key, or reply key
+    HandshakeKey answered{};    // reply key only: offer key answered by this key
 };
 
 HandshakeAction decideHandshake(const Session& s, const IncomingHandshake& h);
