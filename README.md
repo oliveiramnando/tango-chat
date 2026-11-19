@@ -1,5 +1,5 @@
-# TCP Chat
-![CI](https://github.com/oliveiramnando/tcp-chat/actions/workflows/ci.yml/badge.svg)
+# Tango
+![CI](https://github.com/oliveiramnando/tango-chat/actions/workflows/ci.yml/badge.svg)
 
 A terminal-based, end-to-end encrypted TCP chat application written in **C++20**. Clients log in to a multithreaded relay server with a long-term **Ed25519** identity key, save the people they trust as contacts, and open private one-to-one conversations with them. Each conversation uses its own ephemeral **X25519** key exchange, signed with both users' identity keys, and **XChaCha20-Poly1305** authenticated encryption via [libsodium](https://doc.libsodium.org/).
 
@@ -67,8 +67,8 @@ brew install libsodium
 ### Build
 
 ```bash
-git clone https://github.com/oliveiramnando/tcp-chat.git
-cd tcp-chat
+git clone https://github.com/oliveiramnando/tango-chat.git
+cd tango-chat
 make
 ```
 
@@ -355,7 +355,7 @@ The tag lets the recipient reject any message that was altered, truncated or enc
 ## Project Structure
 
 ```text
-tcp-chat/
+tango-chat/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml          # Build and test on Ubuntu and macOS on every push
