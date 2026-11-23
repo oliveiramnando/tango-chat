@@ -3,9 +3,12 @@
 
 #include <vector>
 #include <string>
+#include <map>
+#include <set>
 
 #include "net.hpp"
-
+#include "crypto.hpp"
+#include "contacts.hpp"
 
 struct OutgoingFrame
 {
@@ -36,5 +39,28 @@ struct Effects
     bool fatal = false;
 };
 
+
+class ChatCore 
+{
+public:
+    ChatCore(const Identity& id, std::map<PeerId, Session>& s, Contacts& c, std::set<PeerId>& uids) : me(id), sessions(s), contacts(c), userIds(uids) {}
+
+    Effects onFrame(MsgType type, const std::string& body);
+
+private:
+    const Identity& me;
+    std::map<PeerId, Session>& sessions;
+    Contacts& contacts;
+    std::set<PeerId>& userIds;
+    std::set<PeerId> notifiedUnknown;
+
+    void onMessage(const std::string& body, Effects& out);
+    void onHandshake(const std::string& body, Effects& out);
+    void onError(const std::string& body, Effects& out);
+    void onUserNotFound(const std::string& body, Effects& out);
+    void onUserList(const std::string& body, Effects& out);
+    void onUserOnline(const std::string& body, Effects& out);
+    void onUserOffline(const std::string& body, Effects& out);
+};
 
 #endif
