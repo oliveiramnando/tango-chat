@@ -31,6 +31,7 @@
 #include "crypto.hpp"
 #include "util.hpp"
 #include "contacts.hpp"
+#include "handshake.hpp"
 
 using namespace std;
 
@@ -334,16 +335,32 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
 
                     Session& s = sessions[sender];
 
+                    IncomingHandshake h{};
                     if (isOffer)
                     {
-                        if (s.state == SessionState::READY && memcmp(s.peerPk, peerKey, crypto_kx_PUBLICKEYBYTES) == 0)
-                        {  
-                            redrawPrompt();
-                            continue;
-                        }
+                        h.kind = HandshakeType::OFFER;
+                    }
+                    else
+                    {
+                        h.kind = HandshakeType::REPLY;
+                        memcpy(h.answered.data(), answeredKey, crypto_kx_PUBLICKEYBYTES);
+                    }
 
-                        if (s.state == SessionState::OFFERED && memcmp(s.pk, peerKey, crypto_kx_PUBLICKEYBYTES) < 0)
-                        {
+                    memcpy(h.key.data(), peerKey, crypto_kx_PUBLICKEYBYTES);
+
+                    switch (decideHandshake(s, h))
+                    {
+                        case HandshakeAction::REPLY:
+                            if (!sendReply(clientSocket,id, sender, s, peerKey))
+                            {
+                                cerr << "Failed to reply to handshake." << endl;
+                                wipeSession(s);
+                                sessions.erase(sender);
+                                redrawPrompt();
+                                continue;
+                            }
+                            break;
+                        case HandshakeAction::RESEND_OFFER:
                             if (!resendOffer(clientSocket, id, sender, s))
                             {
                                 cerr << "Failed to resend offer." << endl;
@@ -352,36 +369,22 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                             }  
                             redrawPrompt();
                             continue;
-                        }
-
-                        if (!sendReply(clientSocket,id, sender, s, peerKey))
-                        {
-                            cerr << "Failed to reply to handshake." << endl;
-                            wipeSession(s);
-                            sessions.erase(sender);
+                        case HandshakeAction::DERIVE:
+                            if (!deriveSessionKeys(s, string(peerKey, peerKey + crypto_kx_PUBLICKEYBYTES)))
+                            {
+                                cerr << "Failed to derive session keys. Handshake rejected." << endl;
+                                wipeSession(s);
+                                sessions.erase(sender);
+                                redrawPrompt();
+                                continue;
+                            }
+                            s.state = SessionState::READY;
+                            break;
+                        case HandshakeAction::IGNORE:
                             redrawPrompt();
                             continue;
-                        }
                     }
-                    else
-                    {
-                        if (s.state != SessionState::OFFERED || memcmp(answeredKey, s.pk, crypto_kx_PUBLICKEYBYTES) != 0)
-                        {
-                            redrawPrompt();
-                            continue;
-                        }
-
-                        if (!deriveSessionKeys(s, string(peerKey, peerKey + crypto_kx_PUBLICKEYBYTES)))
-                        {
-                            cerr << "Failed to derive session keys. Handshake rejected." << endl;
-                            wipeSession(s);
-                            sessions.erase(sender);
-                            redrawPrompt();
-                            continue;
-                        }
-                        s.state = SessionState::READY;
-                    }
-
+                    
                     cout << "Verified secure connection with " << displayName(contacts, sender) << endl;
 
                     string fingerPrint = sessionFingerPrint(s);
