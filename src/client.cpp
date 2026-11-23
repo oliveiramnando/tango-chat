@@ -261,65 +261,27 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                         continue;
                     }
 
-                    // check payload size
-                    if (payload.empty())
+                    IncomingHandshake h{};
+                    switch (checkHandshake(payload, sender, id.pk, h))
                     {
-                        cerr << "Malformed payload received." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-
-                    const unsigned char kind = payload[0];
-
-                    const unsigned char* peerKey = nullptr;
-                    const unsigned char* answeredKey = nullptr;
-                    bool isOffer = false;
-
-                    if (kind == static_cast<unsigned char>(HandshakeType::OFFER))
-                    {
-                        if (payload.size() != OFFER_PAYLOAD_SIZE)
-                        {
-                            cerr << "Malformed Offer payload received." << endl;
+                        case HandshakeCheck::OK:
+                            break;
+                        case HandshakeCheck::EMPTY:
+                            cerr << "Malformed payload received." << endl;
                             redrawPrompt();
                             continue;
-                        }
-
-                        peerKey = payload.data() + 1;
-                        const unsigned char* sig = payload.data() + 1 + crypto_kx_PUBLICKEYBYTES;
-
-                        if (!verifyOffer(sender.data(), id.pk, peerKey, sig))
-                        {
-                            cerr << "Offer signature invalid. Rejected." << endl;
+                        case HandshakeCheck::UNKNOWN:
+                            cerr << "Unknown handshake type. Rejected." << endl;
                             redrawPrompt();
                             continue;
-                        }
-                        isOffer = true;
-                    }
-                    else if (kind == static_cast<unsigned char>(HandshakeType::REPLY))
-                    {
-                        if (payload.size() != REPLY_PAYLOAD_SIZE)
-                        {
-                            cerr << "Malformed Reply payload received." << endl;
+                        case HandshakeCheck::BAD_SIZE:
+                            cerr << "Malformed " << (h.kind == HandshakeType::OFFER ? "Offer" : "Reply") << " payload received." << endl;
                             redrawPrompt();
                             continue;
-                        }
-
-                        peerKey = payload.data() + 1;
-                        answeredKey = payload.data() + 1 + crypto_kx_PUBLICKEYBYTES;
-                        const unsigned char* sig = payload.data() + 1 + crypto_kx_PUBLICKEYBYTES*2;
-
-                        if (!verifyReply(sender.data(), id.pk, peerKey, answeredKey, sig))
-                        {
-                            cerr << "Reply signature invalid. Rejected." << endl;
+                        case HandshakeCheck::BAD_SIG:
+                            cerr << (h.kind == HandshakeType::OFFER ? "Offer" : "Reply") << " signature invalid. Rejected." << endl;
                             redrawPrompt();
                             continue;
-                        }
-                    }
-                    else
-                    {
-                        cerr << "Unknown handshake type. Rejected." << endl;
-                        redrawPrompt();
-                        continue;
                     }
 
                     if (!contacts.contains(sender))
@@ -335,23 +297,10 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
 
                     Session& s = sessions[sender];
 
-                    IncomingHandshake h{};
-                    if (isOffer)
-                    {
-                        h.kind = HandshakeType::OFFER;
-                    }
-                    else
-                    {
-                        h.kind = HandshakeType::REPLY;
-                        memcpy(h.answered.data(), answeredKey, crypto_kx_PUBLICKEYBYTES);
-                    }
-
-                    memcpy(h.key.data(), peerKey, crypto_kx_PUBLICKEYBYTES);
-
                     switch (decideHandshake(s, h))
                     {
                         case HandshakeAction::REPLY:
-                            if (!sendReply(clientSocket,id, sender, s, peerKey))
+                            if (!sendReply(clientSocket,id, sender, s, h.key.data()))
                             {
                                 cerr << "Failed to reply to handshake." << endl;
                                 wipeSession(s);
@@ -370,7 +319,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                             redrawPrompt();
                             continue;
                         case HandshakeAction::DERIVE:
-                            if (!deriveSessionKeys(s, string(peerKey, peerKey + crypto_kx_PUBLICKEYBYTES)))
+                            if (!deriveSessionKeys(s, string(h.key.data(), h.key.data() + crypto_kx_PUBLICKEYBYTES)))
                             {
                                 cerr << "Failed to derive session keys. Handshake rejected." << endl;
                                 wipeSession(s);
@@ -384,7 +333,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                             redrawPrompt();
                             continue;
                     }
-                    
+
                     cout << "Verified secure connection with " << displayName(contacts, sender) << endl;
 
                     string fingerPrint = sessionFingerPrint(s);
