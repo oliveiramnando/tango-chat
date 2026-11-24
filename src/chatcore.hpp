@@ -5,6 +5,7 @@
 #include <string>
 #include <map>
 #include <set>
+#include <optional>
 
 #include "net.hpp"
 #include "crypto.hpp"
@@ -22,6 +23,10 @@ enum class UiEventKind
     CONNECTED,  // a secure session was set up
     NOTICE,     // neutral information;; no warning; unknown sender goes here
     WARNING,    // something went wrong or looks suspicious
+
+    INFO,           // cout cmd outputs
+    SENT,           // msg you sent echoed
+    CHAT_CHANGED,   // set promptTarget to event's name
 };
 
 struct UiEvent
@@ -43,7 +48,8 @@ struct Effects
 class ChatCore 
 {
 public:
-    ChatCore(const Identity& id, std::map<PeerId, Session>& s, Contacts& c, std::set<PeerId>& uids) : me(id), sessions(s), contacts(c), userIds(uids) {}
+    ChatCore(const Identity& id, std::map<PeerId, Session>& s, Contacts& c, std::set<PeerId>& uids, const std::string& myName, const std::string& contactsPath) 
+    : me(id), sessions(s), contacts(c), userIds(uids), myName(myName), contactsPath(contactsPath) {}
 
     Effects onFrame(MsgType type, const std::string& body);
     Effects makeOfferTo(const PeerId& peer);
@@ -54,6 +60,11 @@ private:
     Contacts& contacts;
     std::set<PeerId>& userIds;
     std::set<PeerId> notifiedUnknown;
+
+    std::string myName;
+    std::string contactsPath;
+    std::optional<PeerId> currentPeer;
+    std::vector<PeerId> userList;
 
     void onMessage(const std::string& body, Effects& out);
     void onHandshake(const std::string& body, Effects& out);
@@ -68,6 +79,8 @@ private:
     bool makeReply(const PeerId& peer, Session& s, const unsigned char* offerPk, Effects& out);
     bool makeResendOffer(const PeerId& peer, const Session& s, Effects& out);
     bool makeOffer(const PeerId& peer, Session& s, Effects& out);
+
+
 };
 
 #endif
