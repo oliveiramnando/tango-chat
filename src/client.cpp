@@ -384,6 +384,10 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                 }
                 continue;
             case MsgType::ERROR_MSG:
+            case MsgType::USER_NOT_FOUND:
+            case MsgType::USER_LIST:
+            case MsgType::USER_ONLINE:
+            case MsgType::USER_OFFLINE:
                 {
                     bool keepGoing;
                     {
@@ -396,81 +400,6 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     }
                     continue;
                 }
-            case MsgType::USER_NOT_FOUND:
-                {
-                    // server couldn't deliver to this user: they're not online
-                    lock_guard<mutex> lock(terminalMutex);
-                    cout << "\r\033[K";
-                    PeerId missing{};
-                    if (body.size() != missing.size())
-                    {
-                        cerr << "Malformed USER_NOT_FOUND received." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-                    memcpy(missing.data(), body.data(), missing.size());
-                    cerr << displayName(contacts, missing) << " is not online." << endl;
-
-                    // any session with them is stale
-                    auto it = sessions.find(missing);
-                    if (it != sessions.end())
-                    {
-                        wipeSession(it->second);
-                        sessions.erase(it);
-                    }
-                    redrawPrompt();
-                }
-                continue;
-            case MsgType::USER_LIST:
-                {
-                    lock_guard<mutex> lockTerm(terminalMutex);
-                    lock_guard<mutex> lockUid(userIdsMutex);
-                    bool more = false;
-                    if (!parseUserList(body, userIds, more))
-                    {
-                        cerr << "Failed to parse list of online users." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-                    redrawPrompt();
-                }
-                continue;
-            case MsgType::USER_ONLINE:
-                // convert body into peer id and push back to vector
-                {
-                    lock_guard<mutex> lock(userIdsMutex);
-                    PeerId id{};
-                    if (body.size() != PeerId{}.size())
-                    {
-                        // print error here
-                        continue;
-                    }
-
-                    memcpy(id.data(), body.data(), PeerId{}.size());
-                    userIds.insert(id);
-                }
-                continue;
-            case MsgType::USER_OFFLINE:
-                {
-                    lock_guard<mutex> lockTerm(terminalMutex);
-                    lock_guard<mutex> lockUid(userIdsMutex);
-                    PeerId id{};
-                    if (body.size() != PeerId{}.size())
-                    {
-                        // cerr
-                        continue;
-                    }
-                    memcpy(id.data(), body.data(), PeerId{}.size());
-                    userIds.erase(id);
-                    
-                    auto it = sessions.find(id);
-                    if (it != sessions.end())
-                    {
-                        wipeSession(it->second);
-                        sessions.erase(it);
-                    }
-                }
-                continue;
             default:
                 {
                     lock_guard<mutex> lock(terminalMutex);
