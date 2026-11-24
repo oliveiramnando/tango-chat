@@ -1,9 +1,11 @@
 #include "chatcore.hpp"
 
 #include <cstring>
+#include <string>
 
 #include "util.hpp"
 #include "net.hpp"
+#include "handshake.hpp"
 
 using namespace std;
 
@@ -122,7 +124,122 @@ void ChatCore::onMessage(const string& body, Effects& out)
 
 void ChatCore::onHandshake(const string& body, Effects& out) 
 {
-    
+    // parse body here to extract sender
+    PeerId sender{};
+    vector<unsigned char> payload;
+    if (!parseBody(body, sender, payload))
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Malformed HANDSHAKE received.";
+        out.events.push_back(warn);
+        return;
+    }
+
+    IncomingHandshake h{};
+    switch (checkHandshake(payload, sender, me.pk, h))
+    {
+        case HandshakeCheck::OK:
+            break;
+        case HandshakeCheck::EMPTY:
+        {
+            UiEvent warn{};
+            warn.kind = UiEventKind::WARNING;
+            warn.text = "Malformed payload received.";
+            out.events.push_back(warn);
+            return;
+        }
+        case HandshakeCheck::UNKNOWN:
+        {
+            UiEvent warn{};
+            warn.kind = UiEventKind::WARNING;
+            warn.text = "Unknown handshake type. Rejected.";
+            out.events.push_back(warn);
+            return;
+        }
+        case HandshakeCheck::BAD_SIZE:
+        {
+            UiEvent warn{};
+            warn.kind = UiEventKind::WARNING;
+            warn.text = string("Malformed ") + (h.kind == HandshakeType::OFFER ? "Offer" : "Reply") + " payload received.";
+            out.events.push_back(warn);
+            return;
+        }
+        case HandshakeCheck::BAD_SIG:
+        {
+            UiEvent warn{};
+            warn.kind = UiEventKind::WARNING;
+            warn.text = string((h.kind == HandshakeType::OFFER ? "Offer" : "Reply")) + " signature invalid. Rejected.";
+            out.events.push_back(warn);
+            return;
+        }
+    }
+
+    if (!contacts.contains(sender))
+    {
+        if (!notifiedUnknown.contains(sender))
+        {
+            UiEvent notice{};
+            notice.kind = UiEventKind::NOTICE;
+            notice.text = "Unknown [" + idFingerPrint(sender.data()) + "] wants to chat. Compare fingerprints, then /users and /add them.";
+            out.events.push_back(notice);
+        }
+        
+        return;
+    }
+
+    Session& s = sessions[sender];
+    switch (decideHandshake(s, h))
+    {
+        case HandshakeAction::REPLY:
+            if (!makeReply(sender, s, h.key.data(), out))
+            {
+                UiEvent warn{};
+                warn.kind = UiEventKind::WARNING;
+                warn.text = "Failed to reply to handshake.";
+                out.events.push_back(warn);
+
+                wipeSession(s);
+                sessions.erase(sender);
+                return;
+            }
+            break;
+        case HandshakeAction::RESEND_OFFER:
+            if (!makeResendOffer(sender, s, out))
+            {
+                UiEvent warn{};
+                warn.kind = UiEventKind::WARNING;
+                warn.text = "Failed to resend offer.";
+                out.events.push_back(warn);
+
+                wipeSession(s);
+                sessions.erase(sender);
+            }
+            return;
+        case HandshakeAction::DERIVE:
+            if (!deriveSessionKeys(s, string(h.key.data(), h.key.data() + crypto_kx_PUBLICKEYBYTES)))
+            {
+                UiEvent warn{};
+                warn.kind = UiEventKind::WARNING;
+                warn.text = "Failed to derive session keys. Handshake rejected.";
+                out.events.push_back(warn);
+
+                wipeSession(s);
+                sessions.erase(sender);
+                return;
+            }
+            s.state = SessionState::READY;
+            break;
+        case HandshakeAction::IGNORE:
+            return;
+    }
+
+    UiEvent conn{};
+    conn.kind = UiEventKind::CONNECTED;
+    conn.name = displayName(contacts, sender);
+    conn.fingerprint = sessionFingerPrint(s);
+
+    out.events.push_back(conn);
 }
 
 void ChatCore::onError(const string& body, Effects& out) 
