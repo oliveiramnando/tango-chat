@@ -32,6 +32,7 @@
 #include "util.hpp"
 #include "contacts.hpp"
 #include "handshake.hpp"
+#include "chatcore.hpp"
 
 using namespace std;
 
@@ -161,6 +162,27 @@ bool resendOffer(int sock, const Identity& me, const PeerId& peer, const Session
 
     vector<unsigned char> body = buildBody(peer, handshakePayload);
     return sendFrame(sock, MsgType::HANDSHAKE, body);
+}
+
+void showEvent(const UiEvent& event)
+{
+    // caller must hold terminal mutex
+    switch (event.kind)
+    {
+        case UiEventKind::MESSAGE:
+            cout << "\033[94m" << event.name << "\033[0m : " << event.text << endl;
+            break;
+        case UiEventKind::CONNECTED:
+            cout << "Verified secure connection with " << event.name << endl;
+            cout << "Session fingerprint: " << event.fingerprint << endl;
+            break;
+        case UiEventKind::NOTICE:
+            cerr << event.text << endl;
+            break;
+        case UiEventKind::WARNING:
+            cerr << event.text << endl;
+            break;
+    }
 }
 
 
@@ -966,6 +988,7 @@ int main(int argc, char* argv[])
     tcsetattr(STDIN_FILENO, TCSANOW, &modTerminal);
 
     map<PeerId, Session> sessions;
+    ChatCore chatcore(id, sessions, contacts, userIds);
 
     // threads
     thread threadReceive(receiveMsg, clientSocket, ref(sessions), cref(id), ref(contacts));
