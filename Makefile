@@ -11,8 +11,8 @@ BOT_SRCS = src/botclient.cpp
 BOT_HDRS = src/botclient.hpp
 
 # Code only the client (and the tests) use
-CLIENT_SRCS = src/util.cpp src/contacts.cpp src/handshake.cpp
-CLIENT_HDRS = src/util.hpp src/contacts.hpp	src/handshake.hpp
+CLIENT_SRCS = src/util.cpp src/contacts.cpp src/handshake.cpp src/chatcore.cpp
+CLIENT_HDRS = src/util.hpp src/contacts.hpp	src/handshake.hpp src/chatcore.hpp
 
 TEST_FLAGS = $(CXXFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all
 TEST_SRCS  = $(wildcard tests/test_*.cpp)
