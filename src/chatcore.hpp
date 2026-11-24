@@ -61,6 +61,12 @@ private:
     void onUserList(const std::string& body, Effects& out);
     void onUserOnline(const std::string& body, Effects& out);
     void onUserOffline(const std::string& body, Effects& out);
+
+    bool amInitiator(const PeerId& peer);
+
+    bool makeReply(const PeerId& peer, Session& s, const unsigned char* offerPk, Effects& out);
+    bool makeResendOffer(const PeerId& peer, const Session& s, Effects& out);
+    bool makeOffer(const PeerId& peer, Session& s, Effects& out);
 };
 
 #endif

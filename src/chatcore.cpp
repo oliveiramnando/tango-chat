@@ -49,6 +49,7 @@ Effects ChatCore::onFrame(MsgType type, const std::string& body)
     return out;
 }
 
+
 void ChatCore::onMessage(const string& body, Effects& out) 
 {
     PeerId sender{};
@@ -200,5 +201,103 @@ void ChatCore::onUserOffline(const string& body, [[maybe_unused]] Effects& out)
         wipeSession(it->second);
         sessions.erase(it);
     }
+}
+
+
+bool ChatCore::amInitiator(const PeerId& peer)
+{
+    return memcmp(me.pk, peer.data(), crypto_sign_PUBLICKEYBYTES) < 0;
+}
+
+bool ChatCore::makeReply(const PeerId& peer, Session& s, const unsigned char* offerPk, Effects& out)
+{
+    wipeSession(s);
+    s.isInitiator = amInitiator(peer);
+    makeKeyPair(s);
+
+    if (!deriveSessionKeys(s, string(offerPk, offerPk + crypto_kx_PUBLICKEYBYTES)))
+    {
+        return false;
+    }
+
+    unsigned char sig[crypto_sign_BYTES];
+    if (!signReply(me, peer.data(), s.pk, offerPk, sig))
+    {
+        return false;
+    }
+
+    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::REPLY)};       // [type]
+    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);         // [type][key]
+    handshakePayload.insert(handshakePayload.end(), offerPk, offerPk + crypto_kx_PUBLICKEYBYTES);   // [type][key][offer]
+    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);                  // [type][key][offer][sig]
+
+    vector<unsigned char> body = buildBody(peer, handshakePayload);
+
+    OutgoingFrame reply{};
+    reply.type = MsgType::HANDSHAKE;
+    reply.body = body;
+
+    out.frames.push_back(reply);
+
+    s.state = SessionState::READY;
+
+    return true;
+}
+
+bool ChatCore::makeResendOffer(const PeerId& peer, const Session& s, Effects& out)
+{
+    if (s.state != SessionState::OFFERED)
+    {
+        return false;
+    }
+
+    unsigned char sig[crypto_sign_BYTES];
+    if (!signOffer(me, peer.data(), s.pk, sig))
+    {
+        return false;
+    }
+
+    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::OFFER)};   // [type]
+    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [type][key]
+    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [type][key][sig]
+
+    vector<unsigned char> body = buildBody(peer, handshakePayload);
+
+    OutgoingFrame resend{};
+    resend.type = MsgType::HANDSHAKE;
+    resend.body = body;
+
+    out.frames.push_back(resend);
+
+    return true;
+}
+
+bool ChatCore::makeOffer(const PeerId& peer, Session& s, Effects& out)
+{
+    wipeSession(s);
+    s.isInitiator = amInitiator(peer);
+    makeKeyPair(s);
+
+    unsigned char sig[crypto_sign_BYTES];
+    if (!signOffer(me, peer.data(), s.pk, sig))
+    {
+        return false;
+    }
+
+    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::OFFER)};   // [Type]
+    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [Type][Key]
+    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [Type][key][sig]
+
+    vector<unsigned char> body = buildBody(peer, handshakePayload);
+
+    OutgoingFrame offer{};
+    offer.type = MsgType::HANDSHAKE;
+    offer.body = body;
+
+    out.frames.push_back(offer);
+
+    s.state = SessionState::OFFERED;
+
+    return true;
 }
 
