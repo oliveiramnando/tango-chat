@@ -51,7 +51,72 @@ Effects ChatCore::onFrame(MsgType type, const std::string& body)
 
 void ChatCore::onMessage(const string& body, Effects& out) 
 {
+    PeerId sender{};
+    vector<unsigned char> payload;
+    if (!parseBody(body, sender, payload))
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Malformed MESSAGE received.";
+        out.events.push_back(warn);
+        return;
+    }
 
+    // find that sender's session
+    auto it = sessions.find(sender);
+    if (it == sessions.end() || it->second.state != SessionState::READY)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Message from unknown or unsecured peer rejected.";
+        out.events.push_back(warn);
+        return;
+    }
+
+    // decrypt message here with sender's rx jey
+    string nameAndMessage;
+    uint64_t skipped = 0;
+    OpenResult result = openMessage(it->second, sender.data(), me.pk, string(payload.begin(), payload.end()), nameAndMessage, skipped);
+    if (result == OpenResult::INVALID)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Failed to decrypt message.";
+        out.events.push_back(warn);
+        return;
+    }
+    if (result == OpenResult::REPLAYED)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Rejected a repeated or out-of-order message from " + displayName(contacts, sender) + ".";
+        out.events.push_back(warn);
+        return;
+    }
+    if (skipped > 0)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Warning: " + to_string(skipped) + " earlier message(s) from " + displayName(contacts, sender) + " never arrived.";
+        out.events.push_back(warn);
+    }
+
+    size_t colonIdx = nameAndMessage.find(" : ");
+    if (colonIdx == string::npos)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Client sender does not have a name.";
+        out.events.push_back(warn);        
+        return;
+    }
+       
+    UiEvent message{};
+    message.kind = UiEventKind::MESSAGE;
+    message.name = displayName(contacts, sender);
+    message.text = sanitizeForTerminal(nameAndMessage.substr(colonIdx + 3));
+
+    out.events.push_back(message);
 }
 
 void ChatCore::onHandshake(const string& body, Effects& out) 
@@ -75,7 +140,7 @@ void ChatCore::onUserNotFound(const string& body, Effects& out)
     {
         UiEvent warn{};
         warn.kind = UiEventKind::WARNING;
-        warn.text =  "Malformed USER_NOT_FOUND received.";
+        warn.text = "Malformed USER_NOT_FOUND received.";
         out.events.push_back(warn);
         return;
     }
