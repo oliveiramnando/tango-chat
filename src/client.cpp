@@ -185,8 +185,27 @@ void showEvent(const UiEvent& event)
     }
 }
 
+bool applyEffects(int clientSocket, const Effects& e)
+{
+    // caller must hold terminal mutex
+    for (const auto& frame : e.frames)
+    {
+        sendFrame(clientSocket, frame.type, frame.body);    // failed send == connections gone; receipe loop will notice
+    }
 
-void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts)
+    cout << "\r\033[K";
+
+    for (const auto& event : e.events)
+    {
+        showEvent(event);
+    }
+
+    redrawPrompt();
+    return !e.fatal;
+}
+
+
+void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts, ChatCore& core)
 {
     set<PeerId> notifiedUnknown;
     while (true)
@@ -366,12 +385,17 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                 continue;
             case MsgType::ERROR_MSG:
                 {
-                    lock_guard<mutex> lock(terminalMutex);
-                    cout << "\r\033[K";
-                    cerr << sanitizeForTerminal(body) << endl;
-                    redrawPrompt();
+                    bool keepGoing;
+                    {
+                        lock_guard<mutex> lock(terminalMutex);
+                        keepGoing = applyEffects(clientSocket, core.onFrame(type, body));
+                    }
+                    if (!keepGoing) 
+                    {
+                        exit(1);
+                    }
+                    continue;
                 }
-                continue;
             case MsgType::USER_NOT_FOUND:
                 {
                     // server couldn't deliver to this user: they're not online
@@ -988,10 +1012,10 @@ int main(int argc, char* argv[])
     tcsetattr(STDIN_FILENO, TCSANOW, &modTerminal);
 
     map<PeerId, Session> sessions;
-    ChatCore chatcore(id, sessions, contacts, userIds);
+    ChatCore core(id, sessions, contacts, userIds);
 
     // threads
-    thread threadReceive(receiveMsg, clientSocket, ref(sessions), cref(id), ref(contacts));
+    thread threadReceive(receiveMsg, clientSocket, ref(sessions), cref(id), ref(contacts), ref(core));
     thread threadSend(sendMsg, clientSocket, name, ref(sessions), cref(id), ref(contacts), contactsPath);
 
     threadReceive.join();
