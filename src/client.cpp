@@ -31,7 +31,6 @@
 #include "crypto.hpp"
 #include "util.hpp"
 #include "contacts.hpp"
-#include "handshake.hpp"
 #include "chatcore.hpp"
 
 using namespace std;
@@ -76,94 +75,6 @@ bool prepareProfileDir(const string& profile, string& dir)
     return !ec;
 }
 
-bool amInitiator(const Identity& me, const PeerId& peer)
-{
-    return memcmp(me.pk, peer.data(), 32) < 0;
-}
-
-bool sendOffer(int sock, const Identity& me, const PeerId& peer, Session& s)
-{
-    wipeSession(s);
-    s.isInitiator = amInitiator(me, peer);
-    makeKeyPair(s);
-
-    unsigned char sig[crypto_sign_BYTES];
-    if (!signOffer(me, peer.data(), s.pk, sig))
-    {
-        return false;
-    }
-
-    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::OFFER)};   // [Type]
-    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [Type][Key]
-    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [Type][key][sig]
-
-    vector<unsigned char> body = buildBody(peer, handshakePayload);
-
-    if(!sendFrame(sock, MsgType::HANDSHAKE, body))
-    {
-        return false;
-    }
-
-    s.state = SessionState::OFFERED;
-
-    return true;
-}
-
-bool sendReply(int sock, const Identity& me, const PeerId& peer, Session& s, const unsigned char* offerPk)
-{
-    wipeSession(s);
-    s.isInitiator = amInitiator(me, peer);
-    makeKeyPair(s);
-
-    if (!deriveSessionKeys(s, string(offerPk, offerPk + crypto_kx_PUBLICKEYBYTES)))
-    {
-        return false;
-    }
-
-    unsigned char sig[crypto_sign_BYTES];
-    if (!signReply(me, peer.data(), s.pk, offerPk, sig))
-    {
-        return false;
-    }
-
-    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::REPLY)};       // [type]
-    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);         // [type][key]
-    handshakePayload.insert(handshakePayload.end(), offerPk, offerPk + crypto_kx_PUBLICKEYBYTES);   // [type][key][offer]
-    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);                  // [type][key][offer][sig]
-
-    vector<unsigned char> body = buildBody(peer, handshakePayload);
-
-    if (!sendFrame(sock, MsgType::HANDSHAKE, body))
-    {
-        return false;
-    }
-
-    s.state = SessionState::READY;
-
-    return true;
-}
-
-bool resendOffer(int sock, const Identity& me, const PeerId& peer, const Session& s)
-{
-    if (s.state != SessionState::OFFERED)
-    {
-        return false;
-    }
-
-    unsigned char sig[crypto_sign_BYTES];
-    if (!signOffer(me, peer.data(), s.pk, sig))
-    {
-        return false;
-    }
-
-    vector<unsigned char> handshakePayload{static_cast<unsigned char>(HandshakeType::OFFER)};   // [type]
-    handshakePayload.insert(handshakePayload.end(), s.pk, s.pk + crypto_kx_PUBLICKEYBYTES);     // [type][key]
-    handshakePayload.insert(handshakePayload.end(), sig, sig + crypto_sign_BYTES);              // [type][key][sig]
-
-    vector<unsigned char> body = buildBody(peer, handshakePayload);
-    return sendFrame(sock, MsgType::HANDSHAKE, body);
-}
-
 void showEvent(const UiEvent& event)
 {
     // caller must hold terminal mutex
@@ -205,9 +116,8 @@ bool applyEffects(int clientSocket, const Effects& e)
 }
 
 
-void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts, ChatCore& core)
+void receiveMsg(int clientSocket, ChatCore& core)
 {
-    set<PeerId> notifiedUnknown;
     while (true)
     {
         MsgType type;
@@ -224,135 +134,19 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
         }
 
         // branch by type here
-        switch(type)
+        bool keepGoing;
         {
-            case MsgType::HANDSHAKE:
-                {
-                    lock_guard<mutex> lock(terminalMutex);
-
-                    cout << "\r\033[K";
-        
-                    // parse body here to extract sender
-                    PeerId sender{};
-                    vector<unsigned char> payload;
-                    if (!parseBody(body, sender, payload))
-                    {
-                        cerr << "Malformed HANDSHAKE received." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-
-                    IncomingHandshake h{};
-                    switch (checkHandshake(payload, sender, id.pk, h))
-                    {
-                        case HandshakeCheck::OK:
-                            break;
-                        case HandshakeCheck::EMPTY:
-                            cerr << "Malformed payload received." << endl;
-                            redrawPrompt();
-                            continue;
-                        case HandshakeCheck::UNKNOWN:
-                            cerr << "Unknown handshake type. Rejected." << endl;
-                            redrawPrompt();
-                            continue;
-                        case HandshakeCheck::BAD_SIZE:
-                            cerr << "Malformed " << (h.kind == HandshakeType::OFFER ? "Offer" : "Reply") << " payload received." << endl;
-                            redrawPrompt();
-                            continue;
-                        case HandshakeCheck::BAD_SIG:
-                            cerr << (h.kind == HandshakeType::OFFER ? "Offer" : "Reply") << " signature invalid. Rejected." << endl;
-                            redrawPrompt();
-                            continue;
-                    }
-
-                    if (!contacts.contains(sender))
-                    {
-                        if (!notifiedUnknown.contains(sender))
-                        {
-                            cerr << "Unknown [" << idFingerPrint(sender.data()) << "] wants to chat. Compare fingerprints, then /users and /add them." << endl;
-                            notifiedUnknown.insert(sender);
-                        }
-                        redrawPrompt();
-                        continue;
-                    }
-
-                    Session& s = sessions[sender];
-
-                    switch (decideHandshake(s, h))
-                    {
-                        case HandshakeAction::REPLY:
-                            if (!sendReply(clientSocket,id, sender, s, h.key.data()))
-                            {
-                                cerr << "Failed to reply to handshake." << endl;
-                                wipeSession(s);
-                                sessions.erase(sender);
-                                redrawPrompt();
-                                continue;
-                            }
-                            break;
-                        case HandshakeAction::RESEND_OFFER:
-                            if (!resendOffer(clientSocket, id, sender, s))
-                            {
-                                cerr << "Failed to resend offer." << endl;
-                                wipeSession(s);
-                                sessions.erase(sender);
-                            }  
-                            redrawPrompt();
-                            continue;
-                        case HandshakeAction::DERIVE:
-                            if (!deriveSessionKeys(s, string(h.key.data(), h.key.data() + crypto_kx_PUBLICKEYBYTES)))
-                            {
-                                cerr << "Failed to derive session keys. Handshake rejected." << endl;
-                                wipeSession(s);
-                                sessions.erase(sender);
-                                redrawPrompt();
-                                continue;
-                            }
-                            s.state = SessionState::READY;
-                            break;
-                        case HandshakeAction::IGNORE:
-                            redrawPrompt();
-                            continue;
-                    }
-
-                    cout << "Verified secure connection with " << displayName(contacts, sender) << endl;
-
-                    string fingerPrint = sessionFingerPrint(s);
-                    cout << "Session fingerprint: " << fingerPrint << endl;
-
-                    redrawPrompt();
-                }
-                continue;
-            case MsgType::MESSAGE:
-            case MsgType::ERROR_MSG:
-            case MsgType::USER_NOT_FOUND:
-            case MsgType::USER_LIST:
-            case MsgType::USER_ONLINE:
-            case MsgType::USER_OFFLINE:
-                {
-                    bool keepGoing;
-                    {
-                        lock_guard<mutex> lock(terminalMutex);
-                        keepGoing = applyEffects(clientSocket, core.onFrame(type, body));
-                    }
-                    if (!keepGoing) 
-                    {
-                        exit(1);
-                    }
-                    continue;
-                }
-            default:
-                {
-                    lock_guard<mutex> lock(terminalMutex);
-                    cout << "\r\033[K";
-                    cerr << "INVALID MESSAGE TYPE" << endl;
-                }
-                exit(1);
+            lock_guard<mutex> lock(terminalMutex);
+            keepGoing = applyEffects(clientSocket, core.onFrame(type, body));
+        }
+        if (!keepGoing) 
+        {
+            exit(1);
         }
     }
 }
 
-void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts, const string& contactsPath)
+void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& sessions, const Identity& id, Contacts& contacts, const string& contactsPath, ChatCore& core)
 {
     {
         lock_guard<mutex> lock(terminalMutex);
@@ -605,11 +399,7 @@ void sendMsg(int clientSocket, const string& name, map<PeerId, Session>& session
                                 const bool retrying = (it != sessions.end() && it->second.state == SessionState::OFFERED);
                                 cout << (retrying ? "No reply yet, sending a new offer..." : "Establishing secure connection...") << endl;
 
-                                if (!sendOffer(clientSocket, id, selected, sessions[selected]))
-                                {
-                                    sessions.erase(selected);
-                                    cerr << "Failed to send handshake to " << peerName << "." << endl;
-                                }
+                                applyEffects(clientSocket, core.makeOfferTo(selected));
                             }
                         }
                     }
@@ -885,8 +675,8 @@ int main(int argc, char* argv[])
     ChatCore core(id, sessions, contacts, userIds);
 
     // threads
-    thread threadReceive(receiveMsg, clientSocket, ref(sessions), cref(id), ref(contacts), ref(core));
-    thread threadSend(sendMsg, clientSocket, name, ref(sessions), cref(id), ref(contacts), contactsPath);
+    thread threadReceive(receiveMsg, clientSocket, ref(core));
+    thread threadSend(sendMsg, clientSocket, name, ref(sessions), cref(id), ref(contacts), contactsPath, ref(core));
 
     threadReceive.join();
     threadSend.join();
