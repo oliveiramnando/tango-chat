@@ -51,6 +51,24 @@ Effects ChatCore::onFrame(MsgType type, const std::string& body)
     return out;
 }
 
+Effects ChatCore::makeOfferTo(const PeerId& peer)
+{
+    Effects out{};
+
+    if (!makeOffer(peer, sessions[peer], out))
+    {
+        wipeSession(sessions[peer]);
+        sessions.erase(peer);
+
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Failed to send handshake to " + displayName(contacts, peer) + ".";
+        out.events.push_back(warn);
+    }
+
+    return out;
+}
+
 
 void ChatCore::onMessage(const string& body, Effects& out) 
 {

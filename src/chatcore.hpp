@@ -46,6 +46,7 @@ public:
     ChatCore(const Identity& id, std::map<PeerId, Session>& s, Contacts& c, std::set<PeerId>& uids) : me(id), sessions(s), contacts(c), userIds(uids) {}
 
     Effects onFrame(MsgType type, const std::string& body);
+    Effects makeOfferTo(const PeerId& peer);
 
 private:
     const Identity& me;
