@@ -93,6 +93,15 @@ void showEvent(const UiEvent& event)
         case UiEventKind::WARNING:
             cerr << event.text << endl;
             break;
+        case UiEventKind::INFO:
+            cout << event.text << endl;
+            break;
+        case UiEventKind::SENT:
+            cout << "\033[92myou\033[0m : " << event.text << endl;
+            break;
+        case UiEventKind::CHAT_CHANGED:
+            promptTarget = event.name;
+            break;
     }
 }
 
@@ -672,7 +681,7 @@ int main(int argc, char* argv[])
     tcsetattr(STDIN_FILENO, TCSANOW, &modTerminal);
 
     map<PeerId, Session> sessions;
-    ChatCore core(id, sessions, contacts, userIds);
+    ChatCore core(id, sessions, contacts, userIds, name, contactsPath);
 
     // threads
     thread threadReceive(receiveMsg, clientSocket, ref(core));
