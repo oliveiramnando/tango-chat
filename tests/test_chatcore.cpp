@@ -572,3 +572,295 @@ TEST_CASE("chatcore MESSAGE: a message without \" : \" isn't shown as a message"
     CHECK(e.events.size() == 1);
     CHECK_FALSE(e.fatal);
 }
+
+// =====================================================================
+// HANDSHAKE: two cores talking through a fake server
+// =====================================================================
+
+namespace
+{
+// What the server does with a frame from `from` addressed to `to`: check the address,
+// then swap the recipient ID at the front of the body for the sender's ID.
+Effects relayFrame(Client& from, Client& to, const OutgoingFrame& frame)
+{
+    REQUIRE(frame.body.size() >= PeerId{}.size());
+    PeerId recipient{};
+    memcpy(recipient.data(), frame.body.data(), recipient.size());
+    REQUIRE(recipient == to.pid());   // the core addressed it to the right person
+
+    const PeerId sender = from.pid();
+    string delivered(sender.begin(), sender.end());
+    delivered.append(frame.body.begin() + recipient.size(), frame.body.end());
+    return to.receive(frame.type, delivered);
+}
+
+// Everything that happened on one side while the relay ran.
+struct Seen
+{
+    vector<UiEvent> atA, atB;
+};
+
+// Delivers a's pending frames to b and b's to a, again and again, until nobody sends
+// anything more. Like a server forwarding everything as fast as it can.
+Seen pump(Client& a, Effects fromA, Client& b, Effects fromB)
+{
+    Seen seen;
+    seen.atA = fromA.events;
+    seen.atB = fromB.events;
+    for (int round = 0; !fromA.frames.empty() || !fromB.frames.empty(); ++round)
+    {
+        REQUIRE_MESSAGE(round < 20, "handshake never settled");   // catches endless resends
+        Effects nextFromA, nextFromB;
+        for (const OutgoingFrame& f : fromA.frames)
+        {
+            Effects e = relayFrame(a, b, f);
+            seen.atB.insert(seen.atB.end(), e.events.begin(), e.events.end());
+            nextFromB.frames.insert(nextFromB.frames.end(), e.frames.begin(), e.frames.end());
+        }
+        for (const OutgoingFrame& f : fromB.frames)
+        {
+            Effects e = relayFrame(b, a, f);
+            seen.atA.insert(seen.atA.end(), e.events.begin(), e.events.end());
+            nextFromA.frames.insert(nextFromA.frames.end(), e.frames.begin(), e.frames.end());
+        }
+        fromA = nextFromA;
+        fromB = nextFromB;
+    }
+    return seen;
+}
+
+// alice and bob, each saved in the other's contacts
+void makeFriends(Client& alice, Client& bob)
+{
+    alice.contacts[bob.pid()] = "bob";
+    bob.contacts[alice.pid()] = "alice";
+}
+
+vector<UiEvent> ofKind(const vector<UiEvent>& events, UiEventKind kind)
+{
+    vector<UiEvent> found;
+    for (const UiEvent& e : events)
+    {
+        if (e.kind == kind)
+        {
+            found.push_back(e);
+        }
+    }
+    return found;
+}
+
+// both sides READY with matching keys: a message gets through each way
+void checkTalking(Client& alice, Client& bob)
+{
+    REQUIRE(alice.sessions[bob.pid()].state == SessionState::READY);
+    REQUIRE(bob.sessions[alice.pid()].state == SessionState::READY);
+    CHECK(sessionFingerPrint(alice.sessions[bob.pid()]) == sessionFingerPrint(bob.sessions[alice.pid()]));
+
+    Effects atBob = bob.receive(MsgType::MESSAGE, sealedFrom(alice, bob, "alice : hello bob"));
+    REQUIRE(eventsOf(atBob, UiEventKind::MESSAGE).size() == 1);
+    CHECK(atBob.events.back().text == "hello bob");
+
+    Effects atAlice = alice.receive(MsgType::MESSAGE, sealedFrom(bob, alice, "bob : hello alice"));
+    REQUIRE(eventsOf(atAlice, UiEventKind::MESSAGE).size() == 1);
+    CHECK(atAlice.events.back().text == "hello alice");
+}
+}
+
+TEST_CASE("chatcore makeOfferTo: one HANDSHAKE frame to that peer, session OFFERED")
+{
+    Client alice, bob;
+    makeFriends(alice, bob);
+
+    Effects e = alice.core.makeOfferTo(bob.pid());
+    REQUIRE(e.frames.size() == 1);
+    CHECK(e.frames[0].type == MsgType::HANDSHAKE);
+    CHECK(e.events.empty());
+    CHECK(alice.sessions[bob.pid()].state == SessionState::OFFERED);
+
+    // [bob's ID][kind][offer key][sig]
+    REQUIRE(e.frames[0].body.size() == PeerId{}.size() + OFFER_PAYLOAD_SIZE);
+    CHECK(memcmp(e.frames[0].body.data(), bob.pid().data(), PeerId{}.size()) == 0);
+}
+
+TEST_CASE("chatcore HANDSHAKE: offer, reply, both connected with the same fingerprint")
+{
+    Client alice, bob;
+    makeFriends(alice, bob);
+
+    Seen seen = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});
+
+    vector<UiEvent> aliceConnected = ofKind(seen.atA, UiEventKind::CONNECTED);
+    vector<UiEvent> bobConnected = ofKind(seen.atB, UiEventKind::CONNECTED);
+    REQUIRE(aliceConnected.size() == 1);
+    REQUIRE(bobConnected.size() == 1);
+    CHECK(aliceConnected[0].name == "bob");
+    CHECK(bobConnected[0].name == "alice");
+    CHECK_FALSE(aliceConnected[0].fingerprint.empty());
+    CHECK(aliceConnected[0].fingerprint == bobConnected[0].fingerprint);
+    CHECK(ofKind(seen.atA, UiEventKind::WARNING).empty());
+    CHECK(ofKind(seen.atB, UiEventKind::WARNING).empty());
+
+    checkTalking(alice, bob);
+}
+
+TEST_CASE("chatcore HANDSHAKE: crossed offers settle, and both end up connected")
+{
+    for (int i = 0; i < 25; ++i)   // fresh random keys each time, so either side may win
+    {
+        CAPTURE(i);
+        Client alice, bob;
+        makeFriends(alice, bob);
+
+        // both run /chat before either offer arrives
+        Effects aliceOffer = alice.core.makeOfferTo(bob.pid());
+        Effects bobOffer = bob.core.makeOfferTo(alice.pid());
+        Seen seen = pump(alice, aliceOffer, bob, bobOffer);
+
+        CHECK(ofKind(seen.atA, UiEventKind::CONNECTED).size() >= 1);
+        CHECK(ofKind(seen.atB, UiEventKind::CONNECTED).size() >= 1);
+        checkTalking(alice, bob);
+    }
+}
+
+TEST_CASE("chatcore HANDSHAKE: the stuck case connects once both have added each other")
+{
+    Client alice, bob;
+    alice.contacts[bob.pid()] = "bob";   // only alice has saved the other
+
+    // alice offers; bob doesn't know her yet: one notice, no reply
+    Seen first = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});
+    REQUIRE(ofKind(first.atB, UiEventKind::NOTICE).size() == 1);
+    CHECK(first.atB[0].text.find(idFingerPrint(alice.id.pk)) != string::npos);
+    CHECK(ofKind(first.atA, UiEventKind::CONNECTED).empty());
+    CHECK(alice.sessions[bob.pid()].state == SessionState::OFFERED);   // still waiting
+    CHECK_FALSE(bob.sessions.contains(alice.pid()));                   // no session for a stranger
+
+    // bob adds alice and starts a chat himself: both are now OFFERED
+    bob.contacts[alice.pid()] = "alice";
+    Seen second = pump(bob, bob.core.makeOfferTo(alice.pid()), alice, Effects{});
+    CHECK(ofKind(second.atA, UiEventKind::CONNECTED).size() >= 1);
+    CHECK(ofKind(second.atB, UiEventKind::CONNECTED).size() >= 1);
+    checkTalking(alice, bob);
+}
+
+TEST_CASE("chatcore HANDSHAKE: the unknown-sender notice appears only once per person")
+{
+    Client alice, bob, carol;
+    alice.contacts[bob.pid()] = "bob";
+    carol.contacts[bob.pid()] = "bob";
+
+    Seen one = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});
+    Seen two = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});      // alice retries
+    Seen three = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});    // and again
+    CHECK(ofKind(one.atB, UiEventKind::NOTICE).size() == 1);
+    CHECK(two.atB.empty());
+    CHECK(three.atB.empty());
+
+    // a different stranger still gets their own notice
+    Seen fromCarol = pump(carol, carol.core.makeOfferTo(bob.pid()), bob, Effects{});
+    CHECK(ofKind(fromCarol.atB, UiEventKind::NOTICE).size() == 1);
+}
+
+TEST_CASE("chatcore HANDSHAKE: retrying /chat while waiting still connects")
+{
+    Client alice, bob;
+    makeFriends(alice, bob);
+
+    // alice sends three offers; all reach bob, and every reply reaches alice
+    Effects offers;
+    for (int i = 0; i < 3; ++i)
+    {
+        Effects e = alice.core.makeOfferTo(bob.pid());
+        offers.frames.insert(offers.frames.end(), e.frames.begin(), e.frames.end());
+    }
+    Seen seen = pump(alice, offers, bob, Effects{});
+
+    // only the reply to her latest offer counts; the others are stale
+    CHECK(ofKind(seen.atA, UiEventKind::CONNECTED).size() == 1);
+    checkTalking(alice, bob);
+}
+
+TEST_CASE("chatcore HANDSHAKE: an offer delivered twice is answered once")
+{
+    Client alice, bob;
+    makeFriends(alice, bob);
+
+    Effects offer = alice.core.makeOfferTo(bob.pid());
+    REQUIRE(offer.frames.size() == 1);
+
+    Effects firstTime = relayFrame(alice, bob, offer.frames[0]);
+    REQUIRE(firstTime.frames.size() == 1);   // bob replies
+
+    Effects secondTime = relayFrame(alice, bob, offer.frames[0]);
+    CHECK(secondTime.frames.empty());         // duplicate: no second reply
+    CHECK(secondTime.events.empty());
+}
+
+TEST_CASE("chatcore HANDSHAKE: an altered handshake is rejected with a warning and no reply")
+{
+    Client alice, bob;
+    makeFriends(alice, bob);
+
+    Effects offer = alice.core.makeOfferTo(bob.pid());
+    OutgoingFrame changed = offer.frames[0];
+    changed.body.back() ^= 0x01;   // last byte of the signature
+
+    Effects e = relayFrame(alice, bob, changed);
+    CHECK(e.frames.empty());
+    REQUIRE(e.events.size() == 1);
+    CHECK(kindName(e.events[0].kind) == "WARNING");
+    CHECK(e.events[0].text.find("Offer") != string::npos);
+    CHECK_FALSE(bob.sessions.contains(alice.pid()));
+}
+
+TEST_CASE("chatcore HANDSHAKE: a handshake passed off as from someone else is rejected")
+{
+    Client alice, bob, carol;
+    makeFriends(alice, bob);
+    bob.contacts[carol.pid()] = "carol";
+
+    // alice's genuine offer, but the "server" says carol sent it
+    Effects offer = alice.core.makeOfferTo(bob.pid());
+    Effects e = relayFrame(carol, bob, offer.frames[0]);
+    CHECK(e.frames.empty());
+    REQUIRE(e.events.size() == 1);
+    CHECK(kindName(e.events[0].kind) == "WARNING");
+    CHECK_FALSE(bob.sessions.contains(carol.pid()));
+}
+
+TEST_CASE("chatcore HANDSHAKE: malformed handshake bodies are warnings, never fatal")
+{
+    Client bob;
+    const PeerId alice = idOf(0xA1);
+    for (const string& payload : {string(), string(1, '\x07'), string(1, '\x02') + string(10, 'x'),
+                                  string(1, '\x01') + string(10, 'x')})
+    {
+        CAPTURE(payload.size());
+        Effects e = bob.receive(MsgType::HANDSHAKE, bodyOf(alice) + payload);
+        REQUIRE(e.events.size() == 1);
+        CHECK(kindName(e.events[0].kind) == "WARNING");
+        CHECK(e.frames.empty());
+        CHECK_FALSE(e.fatal);
+    }
+    Effects tooShort = bob.receive(MsgType::HANDSHAKE, string(10, 'x'));   // not even an ID
+    REQUIRE(tooShort.events.size() == 1);
+    CHECK(kindName(tooShort.events[0].kind) == "WARNING");
+}
+
+TEST_CASE("chatcore HANDSHAKE: after the peer goes offline, a new handshake starts from scratch")
+{
+    Client alice, bob;
+    makeFriends(alice, bob);
+    pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});
+    REQUIRE(bob.sessions[alice.pid()].state == SessionState::READY);
+
+    // alice leaves; bob's session with her ends
+    bob.receive(MsgType::USER_OFFLINE, bodyOf(alice.pid()));
+    CHECK_FALSE(bob.sessions.contains(alice.pid()));
+
+    // she comes back as a fresh client (same identity) and connects again
+    alice.sessions.clear();
+    Seen again = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});
+    CHECK(ofKind(again.atA, UiEventKind::CONNECTED).size() == 1);
+    checkTalking(alice, bob);
+}
