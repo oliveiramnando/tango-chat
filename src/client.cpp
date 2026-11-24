@@ -226,66 +226,6 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
         // branch by type here
         switch(type)
         {
-            case MsgType::MESSAGE:
-                {
-                    lock_guard<mutex> lock(terminalMutex);
-                    cout << "\r\033[K";
-
-                    PeerId sender{};
-                    vector<unsigned char> payload;
-                    if (!parseBody(body, sender, payload))
-                    {
-                        cerr << "Malformed MESSAGE received." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-
-                    // find taht sender's session
-                    auto it = sessions.find(sender);
-                    if (it == sessions.end() || it->second.state != SessionState::READY)
-                    {
-                        cerr << "Message from unknown or unsecured peer rejected." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-
-                    // decrypt message here with sender's rx jey
-                    string nameAndMessage;
-                    uint64_t skipped = 0;
-                    OpenResult result = openMessage(it->second, sender.data(), id.pk, string(payload.begin(), payload.end()), nameAndMessage, skipped);
-                    if (result == OpenResult::INVALID)
-                    {
-                        cerr << "Failed to decrypt message." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-                    if (result == OpenResult::REPLAYED)
-                    {
-                        cerr << "Rejected a repeated or out-of-order message from " << displayName(contacts, sender) << "." << endl;
-                        redrawPrompt();
-                        continue;
-                    }
-                    if (skipped > 0)
-                    {
-                        cerr << "Warning: " << skipped << " earlier message(s) from " << displayName(contacts, sender) << " never arrived." << endl;
-                    }
-
-                    size_t colonIdx = nameAndMessage.find(" : ");
-                    if (colonIdx == string::npos)
-                    {
-                        cout << "\r\033[K";
-                        cerr << "Client sender does not have a name" << endl;
-                        redrawPrompt();
-                        
-                        continue;
-                    }
-                    string name = nameAndMessage.substr(0, colonIdx);
-                    string message = nameAndMessage.substr(colonIdx + 3);
-                        
-                    cout << "\033[94m" << displayName(contacts, sender) << "\033[0m : " << sanitizeForTerminal(message) << endl;
-                    redrawPrompt();
-                }
-                continue;
             case MsgType::HANDSHAKE:
                 {
                     lock_guard<mutex> lock(terminalMutex);
@@ -383,6 +323,7 @@ void receiveMsg(int clientSocket, map<PeerId, Session>& sessions, const Identity
                     redrawPrompt();
                 }
                 continue;
+            case MsgType::MESSAGE:
             case MsgType::ERROR_MSG:
             case MsgType::USER_NOT_FOUND:
             case MsgType::USER_LIST:
