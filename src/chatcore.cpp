@@ -107,7 +107,7 @@ void ChatCore::onUserList(const string& body, Effects& out)
     }
 }
 
-void ChatCore::onUserOnline(const string& body, Effects& out) 
+void ChatCore::onUserOnline(const string& body, [[maybe_unused]] Effects& out) 
 {
     PeerId id{};
     if (body.size() != PeerId{}.size())
@@ -119,7 +119,7 @@ void ChatCore::onUserOnline(const string& body, Effects& out)
     userIds.insert(id);
 }
 
-void ChatCore::onUserOffline(const string& body, Effects& out) 
+void ChatCore::onUserOffline(const string& body, [[maybe_unused]] Effects& out) 
 {
     PeerId id{};
     if (body.size() != PeerId{}.size())
