@@ -183,6 +183,8 @@ void ChatCore::onHandshake(const string& body, Effects& out)
             notice.kind = UiEventKind::NOTICE;
             notice.text = "Unknown [" + idFingerPrint(sender.data()) + "] wants to chat. Compare fingerprints, then /users and /add them.";
             out.events.push_back(notice);
+
+            notifiedUnknown.insert(sender);
         }
         
         return;
