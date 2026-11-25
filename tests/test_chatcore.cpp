@@ -2,6 +2,7 @@
 #include "chatcore.hpp"
 
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <string>
@@ -13,6 +14,28 @@ using namespace std;
 
 namespace
 {
+// A contacts file path in the system temp folder, deleted (with its .tmp) when the test ends.
+struct TempPath
+{
+    std::string path;
+
+    TempPath()
+    {
+        unsigned char random[8];
+        randombytes_buf(random, sizeof(random));
+        char hex[sizeof(random) * 2 + 1];
+        sodium_bin2hex(hex, sizeof(hex), random, sizeof(random));
+        path = (std::filesystem::temp_directory_path() / ("tango_chatcore_test_" + std::string(hex))).string();
+    }
+
+    ~TempPath()
+    {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        std::filesystem::remove(path + ".tmp", ec);
+    }
+};
+
 // Everything main() gives the core, plus the core itself.
 // The core holds references to the other members, so they're declared FIRST:
 // members are created in declaration order, and destroyed in reverse.
@@ -22,9 +45,14 @@ struct Client
     map<PeerId, Session> sessions;
     Contacts contacts;
     set<PeerId> online;
-    ChatCore core{id, sessions, contacts, online};
+    TempPath contactsFile;
+    ChatCore core;
 
-    Client() { crypto_sign_keypair(id.pk, id.sk); }
+    explicit Client(const string& chatName = "me")
+        : core(id, sessions, contacts, online, chatName, contactsFile.path)
+    {
+        crypto_sign_keypair(id.pk, id.sk);
+    }
 
     // this client's ID, as the server knows it
     PeerId pid() const
@@ -35,6 +63,9 @@ struct Client
     }
 
     Effects receive(MsgType type, const string& body) { return core.onFrame(type, body); }
+
+    // the user typed `line` and pressed Enter
+    Effects type(const string& line) { return core.onInput(line); }
 };
 
 // an ID filled with one repeated byte
@@ -78,6 +109,9 @@ string kindName(UiEventKind k)
         case UiEventKind::CONNECTED: return "CONNECTED";
         case UiEventKind::NOTICE:    return "NOTICE";
         case UiEventKind::WARNING:   return "WARNING";
+        case UiEventKind::INFO:      return "INFO";
+        case UiEventKind::SENT:      return "SENT";
+        case UiEventKind::CHAT_CHANGED: return "CHAT_CHANGED";
     }
     return "?";
 }
@@ -863,4 +897,528 @@ TEST_CASE("chatcore HANDSHAKE: after the peer goes offline, a new handshake star
     Seen again = pump(alice, alice.core.makeOfferTo(bob.pid()), bob, Effects{});
     CHECK(ofKind(again.atA, UiEventKind::CONNECTED).size() == 1);
     checkTalking(alice, bob);
+}
+
+// =====================================================================
+// typed input: commands and messages (onInput)
+// =====================================================================
+
+namespace
+{
+// true if any event's text contains `part`
+bool says(const Effects& e, const string& part)
+{
+    for (const UiEvent& ev : e.events)
+    {
+        if (ev.text.find(part) != string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the server's USER_LIST for `c`: everyone in `others`
+void seesOnline(Client& c, const vector<Client*>& others)
+{
+    vector<PeerId> ids;
+    for (Client* o : others)
+    {
+        ids.push_back(o->pid());
+    }
+    c.receive(MsgType::USER_LIST, userListBody(false, ids));
+}
+
+// types /users, then /add with whichever number `who` has in the list
+Effects typeAdd(Client& c, const Client& who, const string& name)
+{
+    c.type("/users");
+    size_t n = 1;
+    for (const PeerId& id : c.online)   // /users lists the online set in order
+    {
+        if (id == who.pid())
+        {
+            break;
+        }
+        ++n;
+    }
+    return c.type("/add " + to_string(n) + " " + name);
+}
+
+// the contacts file as loadContacts reads it
+Contacts onDisk(const Client& c)
+{
+    Contacts loaded;
+    vector<string> warnings;
+    REQUIRE(loadContacts(c.contactsFile.path, loaded, warnings));
+    return loaded;
+}
+
+// the longest text `name` can send in one frame:
+// [type][recipient ID][counter, nonce, tag][name " : " text] fills MAX_MESSAGE_SIZE exactly
+size_t longestText(const string& name)
+{
+    return MAX_MESSAGE_SIZE - 1 - PeerId{}.size() - MESSAGE_OVERHEAD - (name + " : ").size();
+}
+}
+
+// ---------- plain text ----------
+
+TEST_CASE("chatcore input: an empty line does nothing")
+{
+    Client c;
+    Effects e = c.type("");
+    CHECK(e.events.empty());
+    CHECK(e.frames.empty());
+}
+
+TEST_CASE("chatcore input: text with no chat selected is a warning, nothing sent")
+{
+    Client c;
+    Effects e = c.type("hello?");
+    CHECK(e.frames.empty());
+    REQUIRE(e.events.size() == 1);
+    CHECK(kindName(e.events[0].kind) == "WARNING");
+    CHECK(says(e, "No chat selected"));
+}
+
+TEST_CASE("chatcore input: unknown commands are named, and cleaned first")
+{
+    Client c;
+    Effects e = c.type("/chta bob");
+    REQUIRE(e.events.size() == 1);
+    CHECK(kindName(e.events[0].kind) == "WARNING");
+    CHECK(says(e, "/chta"));
+    CHECK(e.frames.empty());
+
+    Effects pasted = c.type("/x\x1b[2J\x1b[31m");   // escape codes pasted into the command
+    REQUIRE(pasted.events.size() == 1);
+    CHECK_FALSE(hasControlBytes(pasted));
+
+    Effects slash = c.type("/");
+    CHECK(slash.events.size() == 1);
+}
+
+// ---------- /users ----------
+
+TEST_CASE("chatcore /users: one numbered line per online user, saved names where known")
+{
+    Client me, bob, carol;
+    me.contacts[bob.pid()] = "bob";
+    seesOnline(me, {&bob, &carol});
+
+    Effects e = me.type("/users");
+    REQUIRE(e.events.size() == 2);
+    CHECK(e.frames.empty());
+
+    size_t n = 1;
+    for (const PeerId& id : me.online)   // same order as the set
+    {
+        CAPTURE(n);
+        const UiEvent& line = e.events[n - 1];
+        CHECK(kindName(line.kind) == "INFO");
+        const string label = (id == bob.pid()) ? "bob" : idFingerPrint(carol.id.pk);
+        CHECK(line.text == to_string(n) + ") " + label);
+        ++n;
+    }
+}
+
+// ---------- /add ----------
+
+TEST_CASE("chatcore /add: saves the contact in memory and in the file")
+{
+    Client me, bob;
+    seesOnline(me, {&bob});
+
+    Effects e = typeAdd(me, bob, "bob");
+    CHECK(says(e, "Saved bob"));
+    CHECK(says(e, idFingerPrint(bob.id.pk)));
+    CHECK(e.frames.empty());
+    CHECK(me.contacts == Contacts{{bob.pid(), "bob"}});
+    CHECK(onDisk(me) == me.contacts);
+}
+
+TEST_CASE("chatcore /add: the number refers to the last /users list")
+{
+    Client me, bob;
+    seesOnline(me, {&bob});
+
+    SUBCASE("before any /users")
+    {
+        Effects e = me.type("/add 1 bob");
+        CHECK(says(e, "No such user"));
+        CHECK(me.contacts.empty());
+    }
+    SUBCASE("a number past the end of the list")
+    {
+        me.type("/users");
+        Effects e = me.type("/add 2 bob");
+        CHECK(says(e, "No such user"));
+        CHECK(me.contacts.empty());
+    }
+    SUBCASE("not a number")
+    {
+        me.type("/users");
+        CHECK(says(me.type("/add one bob"), "No such user"));
+        CHECK(me.contacts.empty());
+    }
+}
+
+TEST_CASE("chatcore /add: wrong number of words shows the usage")
+{
+    Client me;
+    for (const string& line : {string("/add"), string("/add 1"), string("/add 1 bob extra")})
+    {
+        CAPTURE(line);
+        Effects e = me.type(line);
+        CHECK(says(e, "Usage: /add"));
+        CHECK(e.frames.empty());
+    }
+}
+
+TEST_CASE("chatcore /add: the contact rules still apply, and nothing is saved")
+{
+    Client me, bob, carol;
+    seesOnline(me, {&bob, &carol});
+    REQUIRE(says(typeAdd(me, bob, "bob"), "Saved bob"));
+
+    SUBCASE("the same name again")
+    {
+        CHECK(says(typeAdd(me, bob, "bob"), "already saved"));
+    }
+    SUBCASE("a second name for the same person (no renaming)")
+    {
+        CHECK(says(typeAdd(me, bob, "robert"), "Could not add contact"));
+        CHECK(me.contacts.at(bob.pid()) == "bob");
+    }
+    SUBCASE("a name someone else already has")
+    {
+        CHECK(says(typeAdd(me, carol, "bob"), "Could not add contact"));
+        CHECK_FALSE(me.contacts.contains(carol.pid()));
+    }
+    SUBCASE("an invalid name")
+    {
+        CHECK(says(typeAdd(me, carol, "../carol"), "Could not add contact"));
+        CHECK_FALSE(me.contacts.contains(carol.pid()));
+    }
+    CHECK(onDisk(me) == Contacts{{bob.pid(), "bob"}});
+}
+
+TEST_CASE("chatcore /add: if the file can't be written, memory is left as it was")
+{
+    Client me, bob;
+    seesOnline(me, {&bob});
+    // a contacts path whose folder doesn't exist
+    me.contactsFile.path += "_missing_dir/contacts";
+    ChatCore core(me.id, me.sessions, me.contacts, me.online, "me", me.contactsFile.path);
+
+    core.onInput("/users");
+    Effects e = core.onInput("/add 1 bob");
+    CHECK(says(e, "Could not save"));
+    CHECK(me.contacts.empty());
+}
+
+// ---------- /contacts ----------
+
+TEST_CASE("chatcore /contacts: online contacts are marked with *")
+{
+    Client me, bob, carol;
+    me.contacts[bob.pid()] = "bob";
+    me.contacts[carol.pid()] = "carol";
+    seesOnline(me, {&bob});   // carol is offline
+
+    Effects e = me.type("/contacts");
+    REQUIRE(e.events.size() == 2);
+    CHECK(says(e, "* bob [" + idFingerPrint(bob.id.pk) + "]"));
+    CHECK(says(e, "  carol [" + idFingerPrint(carol.id.pk) + "]"));
+    CHECK_FALSE(says(e, "* carol"));
+}
+
+TEST_CASE("chatcore /contacts: none yet, or extra words")
+{
+    Client me;
+    CHECK(says(me.type("/contacts"), "No contacts yet"));
+    CHECK(says(me.type("/contacts bob"), "Usage: /contacts"));
+}
+
+// ---------- /chat ----------
+
+TEST_CASE("chatcore /chat: selects the contact and sends one offer")
+{
+    Client me, bob;
+    me.contacts[bob.pid()] = "bob";
+    seesOnline(me, {&bob});
+
+    Effects e = me.type("/chat bob");
+    vector<UiEvent> changed = eventsOf(e, UiEventKind::CHAT_CHANGED);
+    REQUIRE(changed.size() == 1);
+    CHECK(changed[0].name == "bob");
+    CHECK(says(e, "Establishing secure connection"));
+
+    REQUIRE(e.frames.size() == 1);
+    CHECK(e.frames[0].type == MsgType::HANDSHAKE);
+    CHECK(memcmp(e.frames[0].body.data(), bob.pid().data(), PeerId{}.size()) == 0);
+    CHECK(me.sessions[bob.pid()].state == SessionState::OFFERED);
+}
+
+TEST_CASE("chatcore /chat: again while waiting sends a fresh offer")
+{
+    Client me, bob;
+    me.contacts[bob.pid()] = "bob";
+    seesOnline(me, {&bob});
+
+    Effects first = me.type("/chat bob");
+    Effects second = me.type("/chat bob");
+    CHECK(says(second, "No reply yet"));
+    REQUIRE(second.frames.size() == 1);
+    CHECK(second.frames[0].body != first.frames[0].body);   // a new key, not a copy
+}
+
+TEST_CASE("chatcore /chat: already connected selects the chat but sends nothing")
+{
+    Client me, bob;
+    me.contacts[bob.pid()] = "bob";
+    seesOnline(me, {&bob});
+    connect(me, bob);
+
+    Effects e = me.type("/chat bob");
+    CHECK(says(e, "Already connected to bob"));
+    CHECK(eventsOf(e, UiEventKind::CHAT_CHANGED).size() == 1);
+    CHECK(e.frames.empty());
+    CHECK(me.sessions[bob.pid()].state == SessionState::READY);   // the session is kept
+}
+
+TEST_CASE("chatcore /chat: refused cases select nothing and send nothing")
+{
+    Client me, bob, carol;
+    me.contacts[carol.pid()] = "carol";   // a contact who is offline
+    seesOnline(me, {&bob});
+
+    for (const string& line : {string("/chat"), string("/chat bob"), string("/chat carol"),
+                               string("/chat carol extra")})
+    {
+        CAPTURE(line);
+        Effects e = me.type(line);
+        CHECK(e.frames.empty());
+        CHECK(eventsOf(e, UiEventKind::CHAT_CHANGED).empty());
+        CHECK(e.events.size() == 1);
+    }
+    CHECK(says(me.type("/chat carol"), "no longer online"));
+    CHECK(says(me.type("/chat bob"), "No such contact"));   // online, but not saved
+    CHECK(me.sessions.empty());
+
+    Client lonely;
+    CHECK(says(lonely.type("/chat bob"), "No contacts yet"));
+}
+
+// ---------- /remove ----------
+
+TEST_CASE("chatcore /remove: deletes the contact, ends the session, closes the chat")
+{
+    Client me, bob;
+    seesOnline(me, {&bob});
+    REQUIRE(says(typeAdd(me, bob, "bob"), "Saved bob"));
+    connect(me, bob);
+    me.type("/chat bob");
+
+    Effects e = me.type("/remove bob");
+    CHECK(says(e, "Contact removed: bob"));
+    CHECK(says(e, "Chat with bob closed"));
+    vector<UiEvent> changed = eventsOf(e, UiEventKind::CHAT_CHANGED);
+    REQUIRE(changed.size() == 1);
+    CHECK(changed[0].name.empty());   // no chat selected
+
+    CHECK(me.contacts.empty());
+    CHECK(onDisk(me).empty());
+    CHECK_FALSE(me.sessions.contains(bob.pid()));
+    CHECK(says(me.type("hello?"), "No chat selected"));
+}
+
+TEST_CASE("chatcore /remove: someone you're not chatting with leaves the chat alone")
+{
+    Client me, bob, carol;
+    seesOnline(me, {&bob, &carol});
+    REQUIRE(says(typeAdd(me, bob, "bob"), "Saved"));
+    REQUIRE(says(typeAdd(me, carol, "carol"), "Saved"));
+    connect(me, bob);
+    me.type("/chat bob");
+
+    Effects e = me.type("/remove carol");
+    CHECK(says(e, "Contact removed: carol"));
+    CHECK(eventsOf(e, UiEventKind::CHAT_CHANGED).empty());
+    CHECK(me.type("still here").frames.size() == 1);   // still chatting with bob
+}
+
+TEST_CASE("chatcore /remove: usage, none saved, unknown name")
+{
+    Client me, bob;
+    CHECK(says(me.type("/remove"), "Usage: /remove"));
+    CHECK(says(me.type("/remove bob"), "No contacts yet"));
+    me.contacts[bob.pid()] = "bob";
+    CHECK(says(me.type("/remove carol"), "No such contact"));
+    CHECK(me.contacts.size() == 1);
+}
+
+// ---------- sending text ----------
+
+TEST_CASE("chatcore send: text in a secured chat becomes one encrypted MESSAGE frame")
+{
+    Client alice("alice"), bob("bob");
+    makeFriends(alice, bob);
+    seesOnline(alice, {&bob});
+    connect(alice, bob);
+    alice.type("/chat bob");
+
+    Effects e = alice.type("hello bob");
+    REQUIRE(e.frames.size() == 1);
+    CHECK(e.frames[0].type == MsgType::MESSAGE);
+
+    // addressed to bob, and the words never appear in clear
+    const vector<unsigned char>& body = e.frames[0].body;
+    CHECK(memcmp(body.data(), bob.pid().data(), PeerId{}.size()) == 0);
+    const string wire(body.begin(), body.end());
+    CHECK(wire.find("hello bob") == string::npos);
+    CHECK(wire.find("alice") == string::npos);
+
+    // echoed to alice as SENT, with just what she typed
+    vector<UiEvent> sent = eventsOf(e, UiEventKind::SENT);
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].text == "hello bob");
+
+    // bob reads it under the name he saved
+    Effects atBob = relayFrame(alice, bob, e.frames[0]);
+    vector<UiEvent> got = eventsOf(atBob, UiEventKind::MESSAGE);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].name == "alice");
+    CHECK(got[0].text == "hello bob");
+}
+
+TEST_CASE("chatcore send: before the handshake finishes, nothing is sent")
+{
+    Client me, bob;
+    me.contacts[bob.pid()] = "bob";
+    seesOnline(me, {&bob});
+    me.type("/chat bob");   // offer sent, no reply yet
+
+    Effects e = me.type("hi");
+    CHECK(e.frames.empty());
+    CHECK(says(e, "not secured yet"));
+    CHECK(eventsOf(e, UiEventKind::SENT).empty());
+}
+
+TEST_CASE("chatcore send: the longest message that fits is sent; one more character isn't")
+{
+    Client alice("alice"), bob("bob");
+    makeFriends(alice, bob);
+    seesOnline(alice, {&bob});
+    connect(alice, bob);
+    alice.type("/chat bob");
+
+    Effects fits = alice.type(string(longestText("alice"), 'x'));
+    REQUIRE(fits.frames.size() == 1);
+    CHECK(1 + fits.frames[0].body.size() == MAX_MESSAGE_SIZE);   // exactly the limit
+    REQUIRE(eventsOf(relayFrame(alice, bob, fits.frames[0]), UiEventKind::MESSAGE).size() == 1);
+
+    Effects tooLong = alice.type(string(longestText("alice") + 1, 'x'));
+    CHECK(tooLong.frames.empty());
+    CHECK(says(tooLong, "too long"));
+}
+
+TEST_CASE("chatcore send: a message that's too long uses no number, so nothing looks lost")
+{
+    Client alice("alice"), bob("bob");
+    makeFriends(alice, bob);
+    seesOnline(alice, {&bob});
+    connect(alice, bob);
+    alice.type("/chat bob");
+
+    const uint64_t before = alice.sessions[bob.pid()].txCounter;
+    alice.type(string(9000, 'x'));
+    CHECK(alice.sessions[bob.pid()].txCounter == before);
+
+    Effects next = alice.type("short one");
+    REQUIRE(next.frames.size() == 1);
+    Effects atBob = relayFrame(alice, bob, next.frames[0]);
+    REQUIRE(atBob.events.size() == 1);                           // no "never arrived" warning
+    CHECK(kindName(atBob.events[0].kind) == "MESSAGE");
+}
+
+TEST_CASE("chatcore send: after the peer goes offline, typing is refused")
+{
+    Client alice("alice"), bob("bob");
+    makeFriends(alice, bob);
+    seesOnline(alice, {&bob});
+    connect(alice, bob);
+    alice.type("/chat bob");
+
+    alice.receive(MsgType::USER_OFFLINE, bodyOf(bob.pid()));
+    Effects e = alice.type("are you there?");
+    CHECK(e.frames.empty());
+    CHECK(says(e, "not secured yet"));
+}
+
+// ---------- a whole conversation, typed ----------
+
+TEST_CASE("chatcore: two users meet and talk using only typed commands")
+{
+    Client alice("alice"), bob("bob");
+    seesOnline(alice, {&bob});
+    seesOnline(bob, {&alice});
+
+    // each adds the other from /users
+    REQUIRE(says(typeAdd(alice, bob, "bob"), "Saved bob"));
+    REQUIRE(says(typeAdd(bob, alice, "alice"), "Saved alice"));
+
+    // alice opens the chat; the "server" relays until the handshake settles
+    Seen hello = pump(alice, alice.type("/chat bob"), bob, Effects{});
+    vector<UiEvent> atAlice = ofKind(hello.atA, UiEventKind::CONNECTED);
+    vector<UiEvent> atBob = ofKind(hello.atB, UiEventKind::CONNECTED);
+    REQUIRE(atAlice.size() == 1);
+    REQUIRE(atBob.size() == 1);
+    CHECK(atAlice[0].fingerprint == atBob[0].fingerprint);
+
+    // bob hasn't picked a chat yet, so he picks alice: already connected, no new offer
+    Effects pick = bob.type("/chat alice");
+    CHECK(pick.frames.empty());
+
+    // a few lines each way
+    for (int i = 0; i < 3; ++i)
+    {
+        CAPTURE(i);
+        Effects fromAlice = alice.type("ping " + to_string(i));
+        REQUIRE(fromAlice.frames.size() == 1);
+        vector<UiEvent> b = eventsOf(relayFrame(alice, bob, fromAlice.frames[0]), UiEventKind::MESSAGE);
+        REQUIRE(b.size() == 1);
+        CHECK(b[0].name == "alice");
+        CHECK(b[0].text == "ping " + to_string(i));
+
+        Effects fromBob = bob.type("pong " + to_string(i));
+        REQUIRE(fromBob.frames.size() == 1);
+        vector<UiEvent> a = eventsOf(relayFrame(bob, alice, fromBob.frames[0]), UiEventKind::MESSAGE);
+        REQUIRE(a.size() == 1);
+        CHECK(a[0].name == "bob");
+        CHECK(a[0].text == "pong " + to_string(i));
+    }
+}
+
+TEST_CASE("chatcore: both type /chat at the same moment and still end up talking")
+{
+    for (int i = 0; i < 10; ++i)
+    {
+        CAPTURE(i);
+        Client alice("alice"), bob("bob");
+        seesOnline(alice, {&bob});
+        seesOnline(bob, {&alice});
+        REQUIRE(says(typeAdd(alice, bob, "bob"), "Saved"));
+        REQUIRE(says(typeAdd(bob, alice, "alice"), "Saved"));
+
+        pump(alice, alice.type("/chat bob"), bob, bob.type("/chat alice"));
+
+        Effects a = alice.type("hi");
+        REQUIRE(a.frames.size() == 1);
+        CHECK(eventsOf(relayFrame(alice, bob, a.frames[0]), UiEventKind::MESSAGE).size() == 1);
+        Effects b = bob.type("hey");
+        REQUIRE(b.frames.size() == 1);
+        CHECK(eventsOf(relayFrame(bob, alice, b.frames[0]), UiEventKind::MESSAGE).size() == 1);
+    }
 }
