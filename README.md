@@ -78,7 +78,7 @@ This produces two executables: `server` and `client`. Both link against libsodiu
 If the compiler or linker cannot find a Homebrew-installed libsodium on macOS:
 
 ```bash
-make CXXFLAGS="-std=c++20 -Wall -Wextra -g -Isrc/common -Isrc/core -Isrc/bot -I$(brew --prefix libsodium)/include" \
+make CXXFLAGS="-std=c++20 -Wall -Wextra -g -I$(brew --prefix libsodium)/include" \
      LDLIBS="-L$(brew --prefix libsodium)/lib -lsodium"
 ```
 
@@ -249,10 +249,10 @@ The file is rewritten in full on every `/add` and `/remove`. The client writes `
 2. `crypto_kx` requires the two sides to take different roles. Each client decides without asking the server: the side whose identity public key compares lower (byte by byte) is the **initiator**, and the other is the **responder**. Both sides always reach the same answer.
 3. `/chat name` looks the contact up and checks they are online. It then generates a fresh ephemeral key pair and sends a signed **offer**. When the peer accepts, it answers with a signed **reply** containing its own ephemeral key **and the offer key it is answering**:
 
-```text
+   ```text
    offer:  "tcpchat-offer-v1" || sender ID || recipient ID || offer key
    reply:  "tcpchat-reply-v1" || sender ID || recipient ID || reply key || answered offer key
-```
+   ```
 
    Only the keys and signature are sent; the receiver rebuilds the signed message. Including both IDs means a handshake meant for one user cannot be redirected to another. The separate labels mean an offer's signature can never be passed off as a reply's, or a login signature as either.
 4. On receiving a `HANDSHAKE`, the client reads the kind byte, checks the payload has exactly the size for that kind, and verifies the signature against the sender's ID (stamped by the server). If any check fails, the frame is dropped **before any session is looked up or changed**.
@@ -467,4 +467,3 @@ Do not rely on this project to protect sensitive information.
 ## License
 
 Licensed under the [MIT License](LICENSE).
- 

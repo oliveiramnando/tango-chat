@@ -1,5 +1,9 @@
 CXX      = g++
-CXXFLAGS = -std=c++20 -Wall -Wextra -g -Isrc/common -Isrc/core -Isrc/bot
+CXXFLAGS = -std=c++20 -Wall -Wextra -g
+
+# Where the project's headers are. Kept out of CXXFLAGS, so overriding
+# CXXFLAGS (as CI does, to add -Werror) can't drop them.
+INCLUDES = -Isrc/common -Isrc/core -Isrc/bot
 LDLIBS   = -lsodium
 
 # Code shared by the client, the server and the tests
@@ -19,21 +23,21 @@ TEST_SRCS  = $(wildcard tests/test_*.cpp)
 
 # The load generator is built optimised and without sanitizers,
 # because we want to measure the server, not the tool's own overhead.
-LOADGEN_FLAGS = -std=c++20 -Wall -Wextra -O2 -pthread -Isrc/common -Isrc/bot
+LOADGEN_FLAGS = -std=c++20 -Wall -Wextra -O2 -pthread
 
 all: server client
 
 server: src/server/server.cpp $(COMMON_SRCS) $(COMMON_HDRS)
-	$(CXX) $(CXXFLAGS) src/server/server.cpp $(COMMON_SRCS) -o server $(LDLIBS)
+	$(CXX) $(INCLUDES) $(CXXFLAGS) src/server/server.cpp $(COMMON_SRCS) -o server $(LDLIBS)
 
 client: src/terminal/client.cpp $(CORE_SRCS) $(CORE_HDRS) $(COMMON_SRCS) $(COMMON_HDRS)
-	$(CXX) $(CXXFLAGS) src/terminal/client.cpp $(CORE_SRCS) $(COMMON_SRCS) -o client $(LDLIBS)
+	$(CXX) $(INCLUDES) $(CXXFLAGS) src/terminal/client.cpp $(CORE_SRCS) $(COMMON_SRCS) -o client $(LDLIBS)
 
 run_tests: $(TEST_SRCS) $(BOT_SRCS) $(BOT_HDRS) $(CORE_SRCS) $(CORE_HDRS) $(COMMON_SRCS) $(COMMON_HDRS)
-	$(CXX) $(TEST_FLAGS) $(TEST_SRCS) $(BOT_SRCS) $(CORE_SRCS) $(COMMON_SRCS) -o run_tests $(LDLIBS)
+	$(CXX) $(INCLUDES) $(TEST_FLAGS) $(TEST_SRCS) $(BOT_SRCS) $(CORE_SRCS) $(COMMON_SRCS) -o run_tests $(LDLIBS)
 
 loadgen: tools/loadgen.cpp $(BOT_SRCS) $(BOT_HDRS) $(COMMON_SRCS) $(COMMON_HDRS)
-	$(CXX) $(LOADGEN_FLAGS) tools/loadgen.cpp $(BOT_SRCS) $(COMMON_SRCS) -o loadgen $(LDLIBS)
+	$(CXX) $(INCLUDES) $(LOADGEN_FLAGS) tools/loadgen.cpp $(BOT_SRCS) $(COMMON_SRCS) -o loadgen $(LDLIBS)
 
 test: run_tests server
 	./run_tests
