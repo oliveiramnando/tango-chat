@@ -438,3 +438,344 @@ bool ChatCore::makeOffer(const PeerId& peer, Session& s, Effects& out)
     return true;
 }
 
+
+void ChatCore::cmdUsers(Effects& out)
+{
+    userList.clear();
+    int n = 1;
+    for (const auto& uid : userIds)
+    { 
+        UiEvent info{};
+        info.kind = UiEventKind::INFO;
+        info.text = to_string(n) + ") " + displayName(contacts, uid);
+
+        out.events.push_back(info);
+        userList.push_back(uid);
+        n++;
+    }
+}
+
+void ChatCore::cmdContacts(const std::vector<std::string>& cmdArgs, Effects& out)
+{
+    if (cmdArgs.size() != 1)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "Usage: /contacts";
+        out.events.push_back(notice);
+    }
+    else if (contacts.empty())
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "No contacts yet. Type /users, then /add n name.";
+        out.events.push_back(notice);
+    }
+    else
+    {
+        for (const auto& [contactId, contactName] : contacts)
+        {
+            if (userIds.contains(contactId))
+            {
+                UiEvent info{};
+                info.kind = UiEventKind::INFO;
+                info.text = "* " + contactName + " [" + idFingerPrint(contactId.data()) + "]";
+                out.events.push_back(info);
+            }
+            else
+            {
+                UiEvent info{};
+                info.kind = UiEventKind::INFO;
+                info.text = "  " + contactName + " [" + idFingerPrint(contactId.data()) + "]";
+                out.events.push_back(info);
+            }
+        }
+    }
+}
+
+void ChatCore::cmdAdd(const std::vector<std::string>& cmdArgs, Effects& out)
+{
+    optional<size_t> index;
+    if (cmdArgs.size() == 3)
+    {
+        index = parseListNumber(cmdArgs[1], userList.size());
+    }
+
+    if (cmdArgs.size() != 3)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "Usage: /add <number from /users> <name>";
+        out.events.push_back(notice);
+    }
+    else if (!index)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "No such user. Type /users to see the list.";
+        out.events.push_back(notice);
+    }
+    else
+    {
+        const PeerId selected = userList[*index];
+        const string& newName = cmdArgs[2];
+
+        auto existing = contacts.find(selected);
+        if (existing != contacts.end() && existing->second == newName)
+        {
+            UiEvent notice{};
+            notice.kind = UiEventKind::NOTICE;
+            notice.text = newName + " is already saved.";
+            out.events.push_back(notice);
+        }
+        else
+        {
+            string error;
+            if (!addContact(contacts, selected, newName, error))
+            {
+                UiEvent notice{};
+                notice.kind = UiEventKind::NOTICE;
+                notice.text = "Could not add contact: " + error;
+                out.events.push_back(notice);
+            }
+            else if (!saveContacts(contactsPath, contacts))
+            {
+                contacts.erase(selected);          // keep memory in step with the file
+
+                UiEvent notice{};
+                notice.kind = UiEventKind::NOTICE;
+                notice.text = "Could not save the contacts file.";
+                out.events.push_back(notice);
+            }
+            else
+            {
+                UiEvent info{};
+                info.kind = UiEventKind::INFO;
+                info.text = "Saved " + newName + " (" + idFingerPrint(selected.data()) + ").";
+                out.events.push_back(info);
+                
+                info.kind = UiEventKind::INFO;
+                info.text = "Only trust this if it matches what " + newName + " sees as 'Your fingerprint'.";
+                out.events.push_back(info);
+            }
+        }
+    }
+}
+
+void ChatCore::cmdRemove(const std::vector<std::string>& cmdArgs, Effects& out)
+{
+    optional<PeerId> contactId;
+    if (cmdArgs.size() == 2)
+    {
+        contactId = findByName(contacts, cmdArgs[1]);
+    }
+
+    if (cmdArgs.size() != 2)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "Usage: /remove <contact name>";
+        out.events.push_back(notice);
+    }
+    else if (contacts.empty())
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "No contacts yet. Type /users, then /add n name.";
+        out.events.push_back(notice);
+    }
+    else if (!contactId)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "No such contact. Type /contacts to see the list.";
+        out.events.push_back(notice);
+    }
+    else
+    {
+        string contactName = cmdArgs[1];
+        contacts.erase(*contactId);
+
+        if (!saveContacts(contactsPath, contacts))
+        {
+            contacts[*contactId] = contactName;         // keep memory in step with the file
+            UiEvent notice{};
+            notice.kind = UiEventKind::NOTICE;
+            notice.text = "Could not save the contacts file.";
+            out.events.push_back(notice);
+        }
+        else
+        {
+            UiEvent info{};
+            info.kind = UiEventKind::INFO;
+            info.text =  "Contact removed: " + contactName + " (" + idFingerPrint(contactId->data()) + ")";
+            out.events.push_back(info);
+
+            // end any session with them
+            auto it = sessions.find(*contactId);
+            if (it != sessions.end())
+            {
+                wipeSession(it->second);
+                sessions.erase(it);
+            }
+
+            // deselect them only if they're the person we're currently chatting with.
+            if (currentPeer && *currentPeer == *contactId)
+            {
+                currentPeer.reset();
+                UiEvent chatChange{};
+                chatChange.kind = UiEventKind::CHAT_CHANGED;
+                out.events.push_back(chatChange);
+
+                info.text =  "Chat with " + contactName + " closed.";
+                out.events.push_back(info);
+            }
+        }
+        
+    }
+}
+
+void ChatCore::cmdChat(const std::vector<std::string>& cmdArgs, Effects& out)
+{
+    optional<PeerId> contactId;
+    if (cmdArgs.size() == 2)
+    {
+        contactId = findByName(contacts, cmdArgs[1]);
+    }
+
+    if (cmdArgs.size() != 2)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "Usage: /chat <contact name>";
+        out.events.push_back(notice);
+    }
+    else if (contacts.empty())
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "No contacts yet. Type /users, then /add n name.";
+        out.events.push_back(notice);
+    }
+    else if (!contactId)
+    {
+        UiEvent notice{};
+        notice.kind = UiEventKind::NOTICE;
+        notice.text = "No such contact. Type /contacts to see the list.";
+        out.events.push_back(notice);
+    }
+    else
+    {
+        PeerId selected = *contactId;
+        
+        if (!userIds.contains(selected))
+        {
+            UiEvent notice{};
+            notice.kind = UiEventKind::NOTICE;
+            notice.text = "That user is no longer online.";
+            out.events.push_back(notice);
+        }
+        else
+        {
+            const string peerName = displayName(contacts, selected);
+
+            UiEvent info{};
+            info.kind = UiEventKind::INFO;
+            info.text = "Now chatting with " + peerName;
+            out.events.push_back(info);
+
+            currentPeer = selected;
+
+            UiEvent chatChange{};
+            chatChange.kind = UiEventKind::CHAT_CHANGED;
+            chatChange.name = peerName;
+            out.events.push_back(chatChange);
+
+            auto it = sessions.find(selected);
+
+            if (it != sessions.end() && it->second.state == SessionState::READY)
+            {
+                UiEvent info{};
+                info.kind = UiEventKind::INFO;
+                info.text = "Already connected to " + peerName + ".";
+                out.events.push_back(info);
+            }
+            else
+            {
+                // NONE (or no session yet): start a handshake.
+                // OFFERED: send a fresh offer; safe at any time, a reply to the old one is ignored as stale.
+                const bool retrying = (it != sessions.end() && it->second.state == SessionState::OFFERED);
+                UiEvent notice{};
+                notice.kind = UiEventKind::NOTICE;
+                notice.text = (retrying ? "No reply yet, sending a new offer..." : "Establishing secure connection...");
+                out.events.push_back(notice);
+
+                Effects offer = makeOfferTo(selected);
+                out.frames.insert(out.frames.end(), offer.frames.begin(), offer.frames.end());
+                out.events.insert(out.events.end(), offer.events.begin(), offer.events.end());
+            }
+        }
+    }
+}
+
+void ChatCore::sendText(const string& line, Effects& out)
+{
+    if (line.empty())
+    {
+        return; 
+    }
+
+    if (!currentPeer)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "No chat selected. Type /contacts, then /chat <name>.";
+        out.events.push_back(warn);
+        return;
+    }
+
+    auto it = sessions.find(*currentPeer);
+    if (it == sessions.end() || it->second.state != SessionState::READY)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Connection not secured yet. Wait for the fingerprint.";
+        out.events.push_back(warn);
+        return;
+    }
+
+    string message = myName + " : " + line; 
+
+    vector<unsigned char> encrypted{};
+    if (!sealMessage(it->second, me.pk, currentPeer->data(), message, encrypted))
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Failed to encrypt message.";
+        out.events.push_back(warn);
+        return;
+    }
+    
+    vector<unsigned char> frameBody = buildBody(*currentPeer, encrypted);
+    if (frameBody.size() + 1 > MAX_MESSAGE_SIZE)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Invalid Message Length.";
+        out.events.push_back(warn);
+        return;
+    }              
+
+    MsgType msg = MsgType::MESSAGE;
+
+    OutgoingFrame send{};
+    send.type = msg;
+    send.body = frameBody;
+    out.frames.push_back(send);
+
+    UiEvent sent{};
+    sent.kind = UiEventKind::SENT;
+    sent.text = line;
+    out.events.push_back(sent);
+}
+

@@ -51,7 +51,7 @@ public:
     ChatCore(const Identity& id, std::map<PeerId, Session>& s, Contacts& c, std::set<PeerId>& uids, const std::string& myName, const std::string& contactsPath) 
     : me(id), sessions(s), contacts(c), userIds(uids), myName(myName), contactsPath(contactsPath) {}
 
-    Effects onFrame(MsgType type, const std::string& body);
+    Effects onFrame(MsgType type, const std::string& body);     // frame arrvied from server
     Effects makeOfferTo(const PeerId& peer);
 
 private:
@@ -80,7 +80,12 @@ private:
     bool makeResendOffer(const PeerId& peer, const Session& s, Effects& out);
     bool makeOffer(const PeerId& peer, Session& s, Effects& out);
 
-
+    void cmdUsers(Effects& out);
+    void cmdContacts(const std::vector<std::string>& cmdArgs, Effects& out);
+    void cmdAdd(const std::vector<std::string>& cmdArgs, Effects& out);
+    void cmdRemove(const std::vector<std::string>& cmdArgs, Effects& out);
+    void cmdChat(const std::vector<std::string>& cmdArgs, Effects& out);
+    void sendText(const std::string& line, Effects& out);
 };
 
 #endif
