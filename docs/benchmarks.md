@@ -20,7 +20,7 @@ Unless a section says otherwise, numbers come from **WSL**. Server and load gene
 
 ### How the load generator measures
 
-- **Bots** are headless clients (`src/botclient.cpp`) that log in, run the signed offer/reply handshake and exchange real encrypted messages, exactly like the terminal client.
+- **Bots** are headless clients (`src/bot/botclient.cpp`) that log in, run the signed offer/reply handshake and exchange real encrypted messages, exactly like the terminal client.
 - Each message is a **probe**: `[8-byte send time][8-byte sequence number][padding]`. The receiver records each message's latency and checks for lost, duplicated, reordered and misdelivered messages.
 - **Warm-up:** the first 10% of each sender's messages are checked for correctness but left out of throughput and latency.
 - **Unpaced runs** (no `--rate`): senders never wait, so queues fill up. Their **throughput** shows the maximum the system can push through; their **latency** mostly shows how long messages sat in queues, and grows with the length of the run. Don't read it as a speed number.
