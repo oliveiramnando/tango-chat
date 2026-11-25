@@ -51,6 +51,35 @@ Effects ChatCore::onFrame(MsgType type, const std::string& body)
     return out;
 }
 
+Effects ChatCore::onInput(const std::string& line)
+{
+    Effects out;
+
+    if (line.starts_with('/'))
+    {
+        vector<string> cmdArgs = splitWords(line);
+        string fcmd = cmdArgs[0];
+        if      (fcmd == "/users")     { cmdUsers(out); }
+        else if (fcmd == "/contacts")  { cmdContacts(cmdArgs, out); }
+        else if (fcmd == "/add")       { cmdAdd(cmdArgs, out); }
+        else if (fcmd == "/remove")    { cmdRemove(cmdArgs, out); }
+        else if (fcmd == "/chat")      { cmdChat(cmdArgs, out); }
+        else 
+        { 
+            UiEvent warn{};
+            warn.kind = UiEventKind::WARNING;
+            warn.text = "Invalid command: " + sanitizeForTerminal(fcmd);
+            out.events.push_back(warn);
+        }
+    }
+    else
+    {
+        sendText(line, out);
+    }
+
+    return out;
+}
+
 Effects ChatCore::makeOfferTo(const PeerId& peer)
 {
     Effects out{};
@@ -746,6 +775,15 @@ void ChatCore::sendText(const string& line, Effects& out)
 
     string message = myName + " : " + line; 
 
+    if (1 + PeerId{}.size() + MESSAGE_OVERHEAD + message.size() > MAX_MESSAGE_SIZE)
+    {
+        UiEvent warn{};
+        warn.kind = UiEventKind::WARNING;
+        warn.text = "Message too long.";
+        out.events.push_back(warn);
+        return;
+    }
+
     vector<unsigned char> encrypted{};
     if (!sealMessage(it->second, me.pk, currentPeer->data(), message, encrypted))
     {
@@ -757,19 +795,9 @@ void ChatCore::sendText(const string& line, Effects& out)
     }
     
     vector<unsigned char> frameBody = buildBody(*currentPeer, encrypted);
-    if (frameBody.size() + 1 > MAX_MESSAGE_SIZE)
-    {
-        UiEvent warn{};
-        warn.kind = UiEventKind::WARNING;
-        warn.text = "Invalid Message Length.";
-        out.events.push_back(warn);
-        return;
-    }              
-
-    MsgType msg = MsgType::MESSAGE;
 
     OutgoingFrame send{};
-    send.type = msg;
+    send.type = MsgType::MESSAGE;
     send.body = frameBody;
     out.frames.push_back(send);
 

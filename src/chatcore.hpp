@@ -54,6 +54,8 @@ public:
     Effects onFrame(MsgType type, const std::string& body);     // frame arrvied from server
     Effects makeOfferTo(const PeerId& peer);
 
+    Effects onInput(const std::string& line);   // user entered this line
+
 private:
     const Identity& me;
     std::map<PeerId, Session>& sessions;
