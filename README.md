@@ -26,7 +26,8 @@ The server authenticates users and routes frames, but it never holds conversatio
 - **Robust multithreaded server:** One thread per client, with a send lock per connection so frames never interleave, connections shared through `shared_ptr` and closed only when no thread can still use them, no network sends while the user registry is locked, send and login timeouts, and a connection cap. A client that stops reading is dropped instead of stalling everyone else.
 - **Input validation:** Frame lengths, message types, IDs, public-key sizes, signatures, ciphertext sizes, profile and contact names, command arguments and contacts-file lines are checked before use. Malformed or unauthenticated data is rejected without crashing.
 - **Load generator:** `loadgen` drives the server with hundreds of headless clients doing real logins, handshakes and encrypted messages, and reports correctness (lost, reordered and misdelivered messages), throughput, latency percentiles and fairness. Modes for paced load, many-to-one traffic, constant reconnects and clients that stop reading reproduced several concurrency bugs, which are now fixed. Results are in [`docs/benchmarks.md`](docs/benchmarks.md).
-- **Tests and CI:** [doctest](https://github.com/doctest/doctest) unit tests for framing, cryptography, contacts and input parsing, plus integration tests that start the real server and talk to it over TCP. All tests run with AddressSanitizer and UndefinedBehaviorSanitizer, on Ubuntu and macOS, on every push through GitHub Actions.
+- **Testable client core:** All of the client's logic (commands, handshakes, sending and receiving messages, presence) lives in a core that does no I/O: it takes received frames and typed lines and returns the frames to send and the events to show. The terminal client is a thin front end around it, so the logic is tested without a network or a terminal, and a new interface can reuse it unchanged.
+- **Tests and CI:** [doctest](https://github.com/doctest/doctest) unit tests for framing, cryptography, the handshake rules, the client core, contacts and input parsing, plus integration tests that start the real server and talk to it over TCP. All tests run with AddressSanitizer and UndefinedBehaviorSanitizer, on Ubuntu and macOS, on every push through GitHub Actions.
 - **Terminal chat interface:** Colored messages, live line editing, a prompt that shows who you are talking to (`you -> bob >`) and is redrawn when messages arrive, and terminal settings restored on every exit path.
 - **Configurable host, port and profile:** Set from the command line, defaulting to `127.0.0.1:8080` and the `default` profile.
 
@@ -77,7 +78,7 @@ This produces two executables: `server` and `client`. Both link against libsodiu
 If the compiler or linker cannot find a Homebrew-installed libsodium on macOS:
 
 ```bash
-make CXXFLAGS="-std=c++20 -Wall -Wextra -g -Isrc -I$(brew --prefix libsodium)/include" \
+make CXXFLAGS="-std=c++20 -Wall -Wextra -g -Isrc/common -Isrc/core -Isrc/bot -I$(brew --prefix libsodium)/include" \
      LDLIBS="-L$(brew --prefix libsodium)/lib -lsodium"
 ```
 
@@ -96,6 +97,8 @@ make test
 This builds the server, then builds `run_tests` from every `tests/test_*.cpp` file with AddressSanitizer and UndefinedBehaviorSanitizer enabled, and runs it:
 
 - **Unit tests** cover framing, handshake signing and verification, key derivation, encryption, message numbering (replays, gaps, altered counters and IDs), the contacts file, name and command parsing, and cleaning received text for the terminal.
+- **Handshake tests** check every row of the handshake rules, including crossed offers over hundreds of random key pairs, and that a handshake is rejected if any byte is changed or it is passed off as from or for someone else.
+- **Client core tests** feed the core received frames and typed lines and check what it sends and shows: every frame type, every command (with a temporary contacts file), the message size limit, and whole conversations between two cores, typed command by command and relayed through a fake server, including both users starting a chat at the same moment.
 - **Integration tests** start `./server` on a free port and connect headless clients to it. They check login, presence, signed offers and replies, private message delivery, rejection of a message delivered twice, rejected logins, offline recipients (`USER_NOT_FOUND`), a user list too long for one frame (300 users), and that malformed frames close only the offending connection while the server keeps running. The server's output during these tests is written to `server_test.log`.
 
 The sanitizers fail the run at the first out-of-bounds memory access or undefined behavior, even if every check would otherwise pass.
@@ -246,10 +249,10 @@ The file is rewritten in full on every `/add` and `/remove`. The client writes `
 2. `crypto_kx` requires the two sides to take different roles. Each client decides without asking the server: the side whose identity public key compares lower (byte by byte) is the **initiator**, and the other is the **responder**. Both sides always reach the same answer.
 3. `/chat name` looks the contact up and checks they are online. It then generates a fresh ephemeral key pair and sends a signed **offer**. When the peer accepts, it answers with a signed **reply** containing its own ephemeral key **and the offer key it is answering**:
 
-   ```text
+```text
    offer:  "tcpchat-offer-v1" || sender ID || recipient ID || offer key
    reply:  "tcpchat-reply-v1" || sender ID || recipient ID || reply key || answered offer key
-   ```
+```
 
    Only the keys and signature are sent; the receiver rebuilds the signed message. Including both IDs means a handshake meant for one user cannot be redirected to another. The separate labels mean an offer's signature can never be passed off as a reply's, or a login signature as either.
 4. On receiving a `HANDSHAKE`, the client reads the kind byte, checks the payload has exactly the size for that kind, and verifies the signature against the sender's ID (stamped by the server). If any check fails, the frame is dropped **before any session is looked up or changed**.
@@ -268,8 +271,17 @@ The file is rewritten in full on every `/add` and `/remove`. The client writes `
    Because both sides see the same two offer keys, crossed offers are always resolved the same way. Sending an offer again is harmless, since a copy the peer has already answered is ignored as a duplicate.
 7. Each client derives a **receive (`rx`)** and **transmit (`tx`)** key and wipes its ephemeral secret key. One side's `tx` equals the other side's `rx`. Both print the peer's name and a session fingerprint (a BLAKE2b hash of both ephemeral keys, in initiator-then-responder order).
 8. Running `/chat` again while an offer is unanswered sends a fresh offer immediately. A late reply to the old offer no longer matches and is ignored, so retrying is safe at any time.
-9. Messages (`name : message`) are numbered from 0 in each direction of each session, encrypted with that peer's `tx` and a new random nonce, sent addressed to the peer, and decrypted by the recipient with its `rx` for the sender (see [Encryption](#encryption)). The recipient displays the name it saved for the sender's ID and ignores the name inside the message. Messages from peers without a Ready session, that fail authentication, or that repeat an earlier number are rejected; if numbers are skipped, the recipient is warned that earlier messages never arrived.
+9. Messages (`name : message`) that would not fit in one frame are refused before they are numbered, so they never cause a false missing-message warning. Messages that fit are numbered from 0 in each direction of each session, encrypted with that peer's `tx` and a new random nonce, sent addressed to the peer, and decrypted by the recipient with its `rx` for the sender (see [Encryption](#encryption)). The recipient displays the name it saved for the sender's ID and ignores the name inside the message. Messages from peers without a Ready session, that fail authentication, or that repeat an earlier number are rejected; if numbers are skipped, the recipient is warned that earlier messages never arrived.
 10. When a peer goes offline, or is removed from your contacts, the client wipes and removes that peer's session.
+
+### Client Design
+
+The client is split into a **core** and a **front end**, so that the logic can be tested on its own and reused by other interfaces:
+
+- **The core** (`src/core/`, class `ChatCore`) holds the chat state (sessions, contacts, who is online, the selected conversation) and makes every decision, but does no I/O. It has two entry points: `onFrame` for a frame received from the server and `onInput` for a line the user typed. Each returns **effects**: the frames to send, the events to show (a message, a verified connection with its fingerprint, a notice or warning, a command's output, the message you sent, a change of conversation) and whether the connection must close.
+- **The handshake rules are separate functions:** `checkHandshake` parses a handshake and verifies its signature, and `decideHandshake` picks the action from the session state, following the table above. Neither touches a socket or a session, so each rule is tested directly.
+- **The terminal front end** (`src/terminal/client.cpp`) logs in, reads keys, and applies effects: it sends the frames and draws the events. Its receive thread and input thread both call the core while holding the terminal lock, so the core needs no locks of its own.
+- **Tests drive the core directly:** two cores can hold a whole conversation through a fake relay in memory, with no server, sockets or terminal involved.
 
 ### Server Design
 
@@ -360,25 +372,36 @@ tango-chat/
 │   └── workflows/
 │       └── ci.yml          # Build and test on Ubuntu and macOS on every push
 ├── src/
-│   ├── client.cpp          # Profiles, login, commands, per-peer sessions, terminal UI, send/receive threads
-│   ├── server.cpp          # Login verification, connections, user registry, presence, routing, limits
-│   ├── crypto.cpp          # Identity keys, login, offer and reply signing, session keys, fingerprints, numbered AEAD messages
-│   ├── crypto.hpp          # Identity, Session and session states, payload sizes, cryptography declarations
-│   ├── contacts.cpp        # Contact rules, hex IDs, loading and safely saving the contacts file
-│   ├── contacts.hpp
-│   ├── botclient.cpp       # Headless client used by the integration tests and the load generator
-│   ├── botclient.hpp
-│   ├── net.cpp             # Framing, addressed bodies, split user lists, socket helpers, TCP_NODELAY
-│   ├── net.hpp             # Message and handshake types, peer IDs, labels, limits, networking declarations
-│   ├── util.cpp            # Name validation, command parsing, cleaning received text for the terminal
-│   └── util.hpp
+│   ├── common/             # Shared by the client, the server and the bots
+│   │   ├── net.cpp         # Framing, addressed bodies, split user lists, socket helpers, TCP_NODELAY
+│   │   ├── net.hpp         # Message and handshake types, peer IDs, labels, limits, networking declarations
+│   │   ├── crypto.cpp      # Identity keys, login, offer and reply signing, session keys, fingerprints, numbered AEAD messages
+│   │   └── crypto.hpp      # Identity, Session and session states, payload sizes, cryptography declarations
+│   ├── core/               # The client's logic, with no I/O: frames and typed lines in, frames and UI events out
+│   │   ├── chatcore.cpp    # Commands, handshakes, sending and receiving messages, presence
+│   │   ├── chatcore.hpp    # ChatCore, Effects, OutgoingFrame and UiEvent
+│   │   ├── handshake.cpp   # Checking a handshake's signature and deciding how to answer it
+│   │   ├── handshake.hpp
+│   │   ├── contacts.cpp    # Contact rules, hex IDs, loading and safely saving the contacts file
+│   │   ├── contacts.hpp
+│   │   ├── util.cpp        # Name validation, command parsing, cleaning received text for the terminal
+│   │   └── util.hpp
+│   ├── terminal/
+│   │   └── client.cpp      # Terminal front end: profiles, login, raw-mode input, drawing UI events
+│   ├── server/
+│   │   └── server.cpp      # Login verification, connections, user registry, presence, routing, limits
+│   └── bot/
+│       ├── botclient.cpp   # Headless client used by the integration tests and the load generator
+│       └── botclient.hpp
 ├── tests/
 │   ├── doctest.h           # Test framework (single header)
 │   ├── test_main.cpp       # Initializes libsodium and runs all tests
 │   ├── test_net.cpp        # Framing, user-list splitting and parsing
 │   ├── test_crypto.cpp     # Offer and reply signing, key derivation, encryption, message numbering
+│   ├── test_handshake.cpp  # Handshake checks and decisions, including crossed offers
+│   ├── test_chatcore.cpp   # The client core: every frame type, every command, whole conversations
 │   ├── test_contacts.cpp   # Hex IDs, contact rules, saving and loading the contacts file
-│   ├── test_util.cpp       # Name validation and command parsing
+│   ├── test_util.cpp       # Name validation, command parsing, terminal sanitizing
 │   └── test_integration.cpp  # Real server over TCP: login, offers and replies, routing, long user lists, malformed frames
 ├── tools/
 │   └── loadgen.cpp         # Load generator: correctness, throughput, latency and fairness under load
@@ -430,7 +453,8 @@ Do not rely on this project to protect sensitive information.
 - [x] Fix server concurrency bugs found under load: interleaved frames, reused sockets, sends under the registry lock, Nagle delays, per-message logging
 - [x] Login timeout, connection cap, and user lists longer than one frame
 - [ ] Freshness check for offers, so a replayed old offer is rejected
-- [ ] Split the client into a core and a front end, with unit tests for the handshake rules
+- [x] Split the client into a core and a front end, with unit tests for the handshake rules
+- [x] Group the sources by layer: common, core, terminal, server and bot
 - [x] Dedicated `USER_NOT_FOUND` frame type instead of `ERROR_MSG`
 - [x] Message counters and additional data: replayed, reordered and dropped messages are detected
 - [x] Clean received text before printing it, so messages can't inject terminal control sequences
@@ -443,3 +467,4 @@ Do not rely on this project to protect sensitive information.
 ## License
 
 Licensed under the [MIT License](LICENSE).
+ 
